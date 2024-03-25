@@ -5,7 +5,9 @@ import time
 import torch
 
 from utils import load, load_jsonl, load_data
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
+
+from transformers import TrainingArguments
 
 def inference(model, tokenizer, prompts, max_length=50):
     for idx, prompt in enumerate(prompts):
@@ -27,8 +29,25 @@ def main(args):
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
 
-    dataset = load_data(args.dataset_name, tokenizer)
-    dataset.save_to_disk(args.dataset_name)
+    # dataset = load_data(args.dataset_name, tokenizer)
+    # dataset.save_to_disk(args.dataset_name)
+
+    dataset = load_from_disk(args.dataset_name)
+    small_train_dataset = dataset["train"].shuffle(seed=42).select(range(1000))
+    small_eval_dataset = dataset["test"].shuffle(seed=42).select(range(1000))
+
+    from transformers import TrainingArguments, Trainer
+
+    training_args = TrainingArguments(output_dir="test_trainer", evaluation_strategy="epoch")
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=small_train_dataset,
+        eval_dataset=small_eval_dataset,
+    )
+
+    trainer.train()
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
