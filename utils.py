@@ -1,6 +1,7 @@
 import torch
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import load_dataset
 
 def load(model_name):
     print(f"Loading model from {model_name} ...")
@@ -26,6 +27,16 @@ def load(model_name):
 
     return model, tokenizer
 
+def load_data(dataset_name, tokenizer):
+    dataset = load_dataset(dataset_name)
+
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True)
+
+    tokenized_datasets = dataset.map(tokenize_function, batched=True)
+    return tokenized_datasets 
+
+    
 def load_jsonl(
     file_path,
 ):
