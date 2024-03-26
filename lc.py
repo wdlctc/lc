@@ -2,12 +2,17 @@ import argparse
 import os
 import time
 
+import tempfile
+
 import torch
+from torch.utils.data import DataLoader
+
+from torch.optim import AdamW
 
 from utils import load, load_jsonl, load_data
 from datasets import load_dataset, load_from_disk
 
-from transformers import TrainingArguments
+from transformers import TrainingArguments, TextDataset, DataCollatorForLanguageModeling
 
 def inference(model, tokenizer, prompts, max_length=50):
     for idx, prompt in enumerate(prompts):
@@ -28,33 +33,62 @@ def main(args):
     
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
-
-    # dataset = load_data(args.dataset_name, tokenizer)
-    # dataset.save_to_disk(args.dataset_name)
-
-    dataset = load_from_disk(args.dataset_name)
-    small_train_dataset = dataset["train"].shuffle(seed=42).select(range(1000))
-    small_eval_dataset = dataset["test"].shuffle(seed=42).select(range(1000))
-
-    from transformers import TrainingArguments, Trainer
-
-    training_args = TrainingArguments(output_dir="test_trainer", evaluation_strategy="epoch")
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=small_train_dataset,
-        eval_dataset=small_eval_dataset,
-    )
-
-    trainer.train()
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+
+    train_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    train_text = " ".join(train_dataset["text"])
     
-    # Set the model to evaluation mode
-    model.eval()
+    # Save the training text to a temporary file
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+        temp_file.write(train_text)
+        train_file = temp_file.name
+    
+    # Create a TextDataset
+    train_dataset = TextDataset(
+        tokenizer=tokenizer,
+        file_path=train_file,
+        block_size=512
+    )
+    # Check the dataset length
+    if len(train_dataset) == 0:
+        raise ValueError("The training dataset is empty. Please provide valid training data.")
+    
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, mlm=False
+    )
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=data_collator
+    )
+    
+    # Set up the optimizer
+    optimizer = AdamW(model.parameters(), lr=5e-5)
+    # Training loop
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        start_time = time.time()
+        model.train()
+        total_loss = 0
+    
+        for batch in train_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+    
+        avg_loss = total_loss / len(train_dataloader)
+        epoch_time = time.time() - start_time
+        print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
+
 
     test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
     print(f"Loading data from {test_filepath} ...")
@@ -71,7 +105,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "--model_name", type=str, default="google-bert/bert-base-uncased"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
