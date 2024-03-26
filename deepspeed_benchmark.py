@@ -49,10 +49,6 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = DDP(model)
-    
-    optimizer = AdamW(model.parameters(), lr=5e-5)
-    
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
         def __init__(self, tokenizer, num_samples, max_length):
@@ -72,9 +68,39 @@ def benchmark_dp(rank, args, world_size):
     num_samples = 100  # Number of random samples you want to generate
     max_length = 512  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
-    
+
+    batch_size = 2
     # DataLoader
-    data_loader = DataLoader(dataset, batch_size=2, shuffle=True)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize DeepSpeed
+    deepspeed_config = {
+        "train_batch_size": batch_size,
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 5e-5
+            }
+        },
+        "zero_optimization": {
+            "stage": 3,
+            "allgather_partitions": True,
+            "allgather_bucket_size": 5e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "contiguous_gradients": True
+        },
+        "dump_state": False,
+        "steps_per_print": 1000000,
+    }
+
+    model_engine, optimizer, _, _ = deepspeed.initialize(
+        args=None,
+        model=model,
+        model_parameters=model.parameters(),
+        config=deepspeed_config
+    )
     
     # Set up the optimizer
     # Training loop
@@ -86,11 +112,10 @@ def benchmark_dp(rank, args, world_size):
     
         for batch in data_loader:
             inputs = batch.to(device)
-            outputs = model(input_ids=inputs, labels=inputs)
+            outputs = model_engine(input_ids=inputs, labels=inputs)
             loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            model_engine.backward(loss)
+            model_engine.step()
             total_loss += loss.item()
     
         avg_loss = total_loss / len(data_loader)
@@ -112,6 +137,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
     )
+    parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
     
@@ -119,9 +145,4 @@ if __name__ == "__main__":
     num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
     print(torch.cuda.device_count())
 
-    mp.spawn(
-        benchmark_dp,
-        args=(args, num_devices),
-        nprocs=num_devices,
-        join=True,
-    )
+    benchmark_dp(args.local_rank, args, num_devices)
