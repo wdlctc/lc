@@ -17,9 +17,9 @@ from transformers import TrainingArguments, TextDataset, DataCollatorForLanguage
 import numpy as np
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel
 import torch.multiprocessing as mp
 import torch.distributed as dist
+import deepspeed
 
 RPC_PORT = 29501
 
@@ -49,7 +49,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = FullyShardedDataParallel(model)
+    model = DDP(model)
     
     optimizer = AdamW(model.parameters(), lr=5e-5)
     

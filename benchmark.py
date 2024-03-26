@@ -29,7 +29,7 @@ def main(args):
     model.to(device)
 
     
-    # optimizer = AdamW(model.parameters(), lr=5e-5)
+    optimizer = AdamW(model.parameters(), lr=5e-5)
     
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
@@ -46,34 +46,34 @@ def main(args):
             random_sequence = np.random.randint(low=0, high=self.vocab_size, size=(self.max_length,))
             return torch.tensor(random_sequence)  
     
-    # # Instantiate the dataset
-    # num_samples = 100  # Number of random samples you want to generate
-    # max_length = 512  # Maximum length of the sequence
-    # dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
+    # Instantiate the dataset
+    num_samples = 100  # Number of random samples you want to generate
+    max_length = 512  # Maximum length of the sequence
+    dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
     
-    # # DataLoader
-    # data_loader = DataLoader(dataset, batch_size=2, shuffle=True)
+    # DataLoader
+    data_loader = DataLoader(dataset, batch_size=2, shuffle=True)
     
-    # # Set up the optimizer
-    # # Training loop
-    # num_epochs = 3
-    # for epoch in range(num_epochs):
-    #     start_time = time.time()
-    #     model.train()
-    #     total_loss = 0
+    # Set up the optimizer
+    # Training loop
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        start_time = time.time()
+        model.train()
+        total_loss = 0
     
-    #     for batch in data_loader:
-    #         inputs = batch.to(device)
-    #         outputs = model(input_ids=inputs, labels=inputs)
-    #         loss = outputs.loss
-    #         loss.backward()
-    #         optimizer.step()
-    #         optimizer.zero_grad()
-    #         total_loss += loss.item()
+        for batch in data_loader:
+            inputs = batch.to(device)
+            outputs = model(input_ids=inputs, labels=inputs)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
     
-    #     avg_loss = total_loss / len(data_loader)
-    #     epoch_time = time.time() - start_time
-    #     print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
+        avg_loss = total_loss / len(data_loader)
+        epoch_time = time.time() - start_time
+        print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
 
 
     print(
@@ -86,7 +86,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="google-bert/bert-base-uncased"
+        "--model_name", type=str, default="google-bert/bert-large-uncased"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
