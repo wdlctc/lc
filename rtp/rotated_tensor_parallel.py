@@ -63,7 +63,16 @@ def split_tensor(
         return tuple(chunk.contiguous() for chunk in tensor_list)
 
     return tensor_list
-
+    
+def split_number(num, parts):
+    base = num // parts
+    remainder = num % parts
+    result = [base] * parts
+    
+    for i in range(remainder):
+        result[i] += 1
+    
+    return result
 
 class ParallelRegion_before(torch.autograd.Function):
     """Pass the input to the model parallel region."""
@@ -349,10 +358,10 @@ class RotatedTensorParallel(nn.Module):
                         module.q_attn.weight = nn.Parameter(split_tensor(module.q_attn.weight, self.world_size, dim=1)[self.rank])
                         if module.q_attn.bias is not None:
                             module.q_attn.bias = nn.Parameter(split_tensor(module.q_attn.bias, self.world_size, dim=0)[self.rank])
-                            module.q_attn.nf = module.c_attn.nf // self.world_size
+                            module.q_attn.nf = module.q_attn.nf // self.world_size
                     module.num_heads = module.num_heads // self.world_size
                     module.split_size = module.split_size // self.world_size
-                    
+
                     module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
                     module = FlyweightWarpper(module, self.group, cat_output=False)
 

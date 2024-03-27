@@ -74,13 +74,12 @@ def benchmark_dp(rank, args, world_size):
             return torch.tensor(random_sequence)  
     
     # Instantiate the dataset
-    num_samples = 100  # Number of random samples you want to generate
+    num_samples = args.num_samples  # Number of random samples you want to generate
     max_length = 512  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
     
     # DataLoader
-    data_loader = DataLoader(dataset, batch_size=2, shuffle=True)
-
+    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     init_random_seed(0)
     
@@ -119,6 +118,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=1
+    )
+    parser.add_argument(
+        "--num_samples", type=int, default=10
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
