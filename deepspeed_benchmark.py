@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 import deepspeed
 
-RPC_PORT = 29501
+RPC_PORT = 29505
 
 def init_random_seed(seed: int):
 

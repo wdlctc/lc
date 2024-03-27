@@ -106,7 +106,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="google-bert/bert-large-uncased"
+        "--model_name", type=str, default="openai-community/gpt2"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
