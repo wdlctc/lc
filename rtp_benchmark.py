@@ -52,7 +52,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = RotatedTensorParallel(model, inplace=True)
+    model = RotatedTensorParallel(model, inplace=False)
 
     model.train()
     
@@ -84,50 +84,31 @@ def benchmark_dp(rank, args, world_size):
     data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     init_random_seed(0)
-    # Inference loop
-    model.eval()
-    total_time = 0
-    decoded_results = []
-    with torch.no_grad():
+    # Set up the optimizer
+    # Training loop
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        start_time = time.time()
+        model.train()
+        total_loss = 0
+    
         for batch in data_loader:
             inputs = batch.to(device)
-            start_time = time.time()
-            past_key_values = None
-            outputs = model(input_ids=inputs, past_key_values=past_key_values, use_cache=True)
-            pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-            generated_ids = [pred_token_idx.item()]
-            for _ in range(50):
-                outputs = model(
-                    input_ids=pred_token_idx,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                
-                past_key_values = outputs.past_key_values
-                pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-                generated_ids.append(pred_token_idx.item())
-                generated_text = (
-                    tokenizer.decode(
-                        generated_ids,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=True,
-                        spaces_between_special_tokens=False,
-                    )
-                    .strip()
-                    .split(" ")
-                )
-                
-            print(" ".join(generated_text[:]), flush=True)
-            
-            end_time = time.time()
-            batch_time = end_time - start_time
-            total_time += batch_time
+            outputs = model(input_ids=inputs, labels=inputs)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+    
+        avg_loss = total_loss / len(data_loader)
+        epoch_time = time.time() - start_time
+        print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
 
-    avg_inference_time = total_time / len(data_loader)
-    print(f"Average Inference Time: {avg_inference_time:.4f} seconds")
+
     print(
-        "Peak allocated bytes on {:4f}GB".format(
-            torch.cuda.memory_stats(rank)["allocated_bytes.all.peak"] / 2**30
+        "Peak allocated bytes on cuda:{}: {:4f}GB".format(
+            dist.get_rank(), torch.cuda.memory_stats(dist.get_rank())["allocated_bytes.all.peak"] / 2**30
         )
     )
 
