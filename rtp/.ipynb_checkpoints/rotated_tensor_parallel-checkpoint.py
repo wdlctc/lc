@@ -29,6 +29,7 @@ def hook_fn_inplace(sub_module, module, *unused: Any):
     sub_module.count -= 1
     if sub_module.count == 0:
         module.grad_reqs = counter_clock_rotation_buffer(module._full_grad.data, module._full_grad.data)
+        module.rank = (module.rank + module.world_size - 1 + module.world_size) % module.world_size
 
 def ensure_divisibility(numerator: int, denominator: int) -> None:
     """Ensure that numerator is divisible by the denominator."""
@@ -299,7 +300,9 @@ class FlyweightWarpper(nn.Module):
 
             if self.cat_output:
                 output_parallel = torch.cat(output_list, dim=self.output_partition_dim).contiguous()
-        
+
+        self.rank = (self.rank - self.world_size + 1 + self.world_size) % self.world_size
+
         if 'unused' in locals():
             return output_parallel, *unused
         else:

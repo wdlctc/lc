@@ -1,28 +1,14 @@
 import argparse
 import os
 import time
-
 import tempfile
-
 import torch
 from torch.utils.data import DataLoader, Dataset
-
 from torch.optim import AdamW
-
 from utils import load, load_jsonl, load_data
 from datasets import load_dataset, load_from_disk
-
 from transformers import TrainingArguments, TextDataset, DataCollatorForLanguageModeling
-
 import numpy as np
-
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.multiprocessing as mp
-import torch.distributed as dist
-
-from rtp.rotated_tensor_parallel import RotatedTensorParallel
-
-RPC_PORT = 29501
 
 def init_random_seed(seed: int):
 
@@ -30,36 +16,17 @@ def init_random_seed(seed: int):
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
 
-
-
-def benchmark_dp(rank, args, world_size):
-    """Benchmark a given model using a single process and multiple devices."""
-    init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
-    torch.distributed.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, init_method=init_method_pgroup
-    )
-
-    torch.cuda.set_device(rank)
-    init_random_seed(0)
-    
+def main(args):
     # Specify the pretrained model name or path
     model_name = args.model_name
-    
+
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
-    
+
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    
-    model = RotatedTensorParallel(model, inplace=True)
 
-    model.train()
-    
-    print(model)
-    
-    optimizer = AdamW(model.parameters(), lr=5e-5)
-    
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
         def __init__(self, tokenizer, num_samples, max_length):
@@ -67,22 +34,22 @@ def benchmark_dp(rank, args, world_size):
             self.num_samples = num_samples
             self.max_length = max_length
             self.vocab_size = len(tokenizer)  # Get the size of the tokenizer's vocabulary
-    
+
         def __len__(self):
             return self.num_samples
-        
+
         def __getitem__(self, idx):
             random_sequence = np.random.randint(low=0, high=self.vocab_size, size=(self.max_length,))
-            return torch.tensor(random_sequence)  
-    
+            return torch.tensor(random_sequence)
+
     # Instantiate the dataset
     num_samples = args.num_samples  # Number of random samples you want to generate
     max_length = args.max_length  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
-    
+
     # DataLoader
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
+    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+
     init_random_seed(0)
     # Inference loop
     model.eval()
@@ -127,9 +94,10 @@ def benchmark_dp(rank, args, world_size):
     print(f"Average Inference Time: {avg_inference_time:.4f} seconds")
     print(
         "Peak allocated bytes on {:4f}GB".format(
-            torch.cuda.memory_stats(rank)["allocated_bytes.all.peak"] / 2**30
+            torch.cuda.memory_stats(0)["allocated_bytes.all.peak"] / 2**30
         )
     )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -150,14 +118,4 @@ if __name__ == "__main__":
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
-    
-    print(f"Running DP benchmark with args: {args}")
-    num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    print(torch.cuda.device_count())
-
-    mp.spawn(
-        benchmark_dp,
-        args=(args, num_devices),
-        nprocs=num_devices,
-        join=True,
-    )
+    main(args)

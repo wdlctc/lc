@@ -20,8 +20,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
-from rtp.rotated_tensor_parallel import RotatedTensorParallel
-
 RPC_PORT = 29501
 
 def init_random_seed(seed: int):
@@ -29,9 +27,7 @@ def init_random_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
-
-
-
+    
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
@@ -52,11 +48,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = RotatedTensorParallel(model, inplace=True)
-
-    model.train()
-    
-    print(model)
+    model = DDP(model)
     
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
@@ -127,7 +119,7 @@ def benchmark_dp(rank, args, world_size):
     print(f"Average Inference Time: {avg_inference_time:.4f} seconds")
     print(
         "Peak allocated bytes on {:4f}GB".format(
-            torch.cuda.memory_stats(rank)["allocated_bytes.all.peak"] / 2**30
+            torch.cuda.memory_stats(0)["allocated_bytes.all.peak"] / 2**30
         )
     )
 
