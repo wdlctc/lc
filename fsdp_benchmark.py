@@ -70,7 +70,7 @@ def benchmark_dp(rank, args, world_size):
     
     # Instantiate the dataset
     num_samples = args.num_samples  # Number of random samples you want to generate
-    max_length = 512  # Maximum length of the sequence
+    max_length = args.max_length  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
     
     # DataLoader
@@ -117,6 +117,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num_samples", type=int, default=10
+    )
+    parser.add_argument(
+        "--max_length", type=int, default=512
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
