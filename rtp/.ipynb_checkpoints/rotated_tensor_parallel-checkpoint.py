@@ -37,7 +37,6 @@ def hook_fn_inplace(sub_module, module, *unused: Any):
     if sub_module.count == 0:
         module.grad_reqs = counter_clock_rotation_buffer(module._full_grad.data, module._full_grad.data)
         if module.e:
-            print("yes")
             module.rank = (module.rank + module.world_size - 1 +module.world_size) % module.world_size
 
 def ensure_divisibility(numerator: int, denominator: int) -> None:
@@ -428,7 +427,7 @@ class RotatedTensorParallel(nn.Module):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, nn.MultiheadAttention) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or  isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention)  
+        is_MultiheadAttention = isinstance(module, nn.MultiheadAttention) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention) or  isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention)  
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
@@ -461,6 +460,24 @@ class RotatedTensorParallel(nn.Module):
                     module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
                     if module.c_proj.bias is not None:
                         module.c_proj.bias.data.div_(self.world_size)
+                    module = FlyweightWarpper(module, self.group, cat_output=False, inplace=self.inplace)
+
+                    setattr(upper_module, name, module)
+
+                    self.FlyweightModule_list.append(module)
+                elif isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention):
+                    module.q_proj.weight = nn.Parameter(split_tensor(module.q_proj.weight, self.world_size, dim=0)[self.rank])
+                        
+                    module.k_proj.weight = nn.Parameter(split_tensor(module.k_proj.weight, self.world_size, dim=0)[self.rank])
+                        
+                    module.v_proj.weight = nn.Parameter(split_tensor(module.v_proj.weight, self.world_size, dim=0)[self.rank])
+    
+                    module.out_proj.weight = nn.Parameter(split_tensor(module.out_proj.weight, self.world_size, dim=1)[self.rank])
+                    if module.out_proj.bias is not None:
+                        module.out_proj.bias.data.div_(self.world_size)
+                        
+                    module.num_heads = module.num_heads // self.world_size
+
                     module = FlyweightWarpper(module, self.group, cat_output=False, inplace=self.inplace)
 
                     setattr(upper_module, name, module)

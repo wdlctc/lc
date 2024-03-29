@@ -36,6 +36,26 @@ def init_random_seed(seed: int):
     np.random.seed(seed)
 
 
+def _gather(input_: torch.Tensor, dim) -> torch.Tensor:
+
+    # Bypass the function if we are using only 1 GPU.
+    if torch.distributed.get_world_size() == 1:
+        return input_
+
+    # Size and dimension.
+    last_dim = input_.dim() - 1
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+    tensor_list[rank] = input_
+    torch.distributed.all_gather(tensor_list, input_)
+
+    # Note: torch.cat already creates a contiguous tensor.
+    output = torch.cat(tensor_list, dim=dim).contiguous()
+
+    return output
+
 
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
@@ -52,6 +72,7 @@ def benchmark_dp(rank, args, world_size):
     
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
+    model.eval()
 
     
     def RecursiveVisit(name, module, upper_module):
@@ -65,12 +86,12 @@ def benchmark_dp(rank, args, world_size):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) 
+        is_MultiheadAttention = isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention) 
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 m = RecursiveVisit(name, child, module)
-                if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+                if isinstance(m, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention):
                     return m
         else:
             return module
@@ -82,30 +103,35 @@ def benchmark_dp(rank, args, world_size):
     rtp_attention = copy.deepcopy(attention)
 
     del model
-    print(attention)
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
     ddp_attention = DDP(ddp_attention.to(device))
     fsdp_attention = FullyShardedDataParallel(fsdp_attention.to(device))
-    rtp_attention = RotatedTensorParallel(rtp_attention.to(device), inplace=True)
-    rtp_attention.eval()
+    rtp_attention = RotatedTensorParallel(rtp_attention.to(device))
+    # rtp_attention.eval()
+    
+    print(attention, rtp_attention)
+    print(attention.attn_dropout, attention.resid_dropout)
     
     num_epochs = 3
+    init_random_seed(0)
     for epoch in range(num_epochs):
         start_time = time.time()
         batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
         inputs = batch.to(device)
-        outputs = attention(hidden_states=inputs)
-        DDP_outputs = ddp_attention(hidden_states=inputs)
-        fsdp_outputs = fsdp_attention(hidden_states=inputs)
-        rtp_outputs = rtp_attention(hidden_states=inputs)
+        outputs = attention(hidden_states=inputs, output_attentions=True)
+        DDP_outputs = ddp_attention(hidden_states=inputs, output_attentions=True)
+        fsdp_outputs = fsdp_attention(hidden_states=inputs, output_attentions=True)
+        rtp_outputs = rtp_attention(hidden_states=inputs, output_attentions=True)
 
-        assert torch.allclose(outputs[0], rtp_outputs[0], atol=1e-7), f"{outputs[0]}\nvs\n{rtp_outputs[0]}"
+        print(outputs[2].shape)
+
+        assert torch.allclose(outputs[2], _gather(rtp_outputs[2], dim=1), atol=1e-5), f"{((outputs[2],_gather(rtp_outputs[2], dim=1)))}"
 
         outputs[0].mean().backward()
-        fsdp_outputs[0].mean().backward()
+        rtp_outputs[0].mean().backward()
         
 
         epoch_time = time.time() - start_time
@@ -121,7 +147,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="openai-community/gpt2"
+        "--model_name", type=str, default="EleutherAI/gpt-neo-125m"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -133,7 +159,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=5
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
