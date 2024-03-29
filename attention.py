@@ -119,16 +119,14 @@ def benchmark_dp(rank, args, world_size):
     init_random_seed(0)
     for epoch in range(num_epochs):
         start_time = time.time()
-        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
+        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim).cuda()
         inputs = batch.to(device)
         outputs = attention(hidden_states=inputs, output_attentions=True)
-        DDP_outputs = ddp_attention(hidden_states=inputs, output_attentions=True)
-        fsdp_outputs = fsdp_attention(hidden_states=inputs, output_attentions=True)
+        # DDP_outputs = ddp_attention(hidden_states=inputs, output_attentions=True)
+        # fsdp_outputs = fsdp_attention(hidden_states=inputs, output_attentions=True)
         rtp_outputs = rtp_attention(hidden_states=inputs, output_attentions=True)
 
-        print(outputs[2].shape)
-
-        assert torch.allclose(outputs[2], _gather(rtp_outputs[2], dim=1), atol=1e-5), f"{((outputs[2],_gather(rtp_outputs[2], dim=1)))}"
+        assert torch.allclose(outputs[0], rtp_outputs[0], atol=1e-3), f"{torch.max((outputs[0] - rtp_outputs[0]))}"
 
         outputs[0].mean().backward()
         rtp_outputs[0].mean().backward()

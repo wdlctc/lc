@@ -51,11 +51,6 @@ def benchmark_dp(rank, args, world_size):
     
     model = FullyShardedDataParallel(model)
     
-    model2, tokenizer2 = load(model_name)
-
-    model2.to(device)
-    model2 = DDP(model2)
-    
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
     # Random data generator dataset class
@@ -93,15 +88,10 @@ def benchmark_dp(rank, args, world_size):
             inputs = batch.to(device)
             outputs = model(input_ids=inputs, labels=inputs, use_cache=False, past_key_values=None)
             loss = outputs.loss
-
-            
-            outputs2 = model(input_ids=inputs, labels=inputs, use_cache=False, past_key_values=None)
-            loss2 = outputs2.loss
-            print((outputs.logits), (outputs2.logits))
-            # loss.backward()
-            # optimizer.step()
-            # optimizer.zero_grad()
-            # total_loss += loss.item()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
     
         avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time

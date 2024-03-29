@@ -52,7 +52,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = RotatedTensorParallel(model, inplace=False)
+    model = RotatedTensorParallel(model)
 
     model.train()
     
