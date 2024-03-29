@@ -29,11 +29,16 @@ def hook_fn(sub_module, module, *unused: Any):
     sub_module.count -= 1
     if sub_module.count == 0:
         module.grad_reqs = counter_clock_rotation_buffer(module._full_grad.data, module._grad_buffer)
+        if module.e:
+            module.rank = (module.rank + module.world_size - 1 +module.world_size) % module.world_size
 
 def hook_fn_inplace(sub_module, module, *unused: Any):
     sub_module.count -= 1
     if sub_module.count == 0:
         module.grad_reqs = counter_clock_rotation_buffer(module._full_grad.data, module._full_grad.data)
+        if module.e:
+            print("yes")
+            module.rank = (module.rank + module.world_size - 1 +module.world_size) % module.world_size
 
 def ensure_divisibility(numerator: int, denominator: int) -> None:
     """Ensure that numerator is divisible by the denominator."""
@@ -298,6 +303,7 @@ class FlyweightWarpper(nn.Module):
         self.group = group if group is not None else dist.group.WORLD
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
+        self.e = False
         
         # Handle param_list being None.
         if param_list is None:
@@ -358,7 +364,11 @@ class FlyweightWarpper(nn.Module):
             for i in range(self.world_size):
                 index = (self.rank -i +self.world_size) % self.world_size
                 if not self.inplace:
-                    ParallelRegion_before.apply(args[0], self, i)
+                    if args:
+                        ParallelRegion_before.apply(args[0], self, i)
+                    else:
+                        ParallelRegion_before.apply(kwargs['hidden_states'], self, i)
+                        
 
                 outputs = self.module_list[index](*args, **kwargs)
                 if isinstance(outputs, tuple):
@@ -382,6 +392,9 @@ class FlyweightWarpper(nn.Module):
             if self.cat_output:
                 output_parallel = torch.cat(output_list, dim=self.output_partition_dim).contiguous()
 
+        if self.e:
+            self.rank = (self.rank - self.world_size + 1 +self.world_size) % self.world_size
+
         if 'unused' in locals():
             return output_parallel, *unused
         else:
@@ -402,6 +415,7 @@ class RotatedTensorParallel(nn.Module):
         self.inplace = inplace
         self.FlyweightModule_list = []
         self.RecursiveVisit('module', self.module, self)
+        self.e = False
         
     def RecursiveVisit(self, name, module, upper_module):
         """
@@ -445,6 +459,8 @@ class RotatedTensorParallel(nn.Module):
                     module.split_size = module.split_size // self.world_size
 
                     module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+                    if module.c_proj.bias is not None:
+                        module.c_proj.bias.data.div_(self.world_size)
                     module = FlyweightWarpper(module, self.group, cat_output=False, inplace=self.inplace)
 
                     setattr(upper_module, name, module)
@@ -510,6 +526,10 @@ class RotatedTensorParallel(nn.Module):
                 else:
                     print(module, type(module))
 
+    def eval(self):
+        self.e = True
+        for module in self.FlyweightModule_list:
+            module.e = True
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
