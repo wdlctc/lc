@@ -119,7 +119,7 @@ def benchmark_dp(rank, args, world_size):
     init_random_seed(0)
     for epoch in range(num_epochs):
         start_time = time.time()
-        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim).cuda()
+        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
         inputs = batch.to(device)
         outputs = attention(hidden_states=inputs, output_attentions=True)
         # DDP_outputs = ddp_attention(hidden_states=inputs, output_attentions=True)

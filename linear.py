@@ -73,30 +73,30 @@ def benchmark_dp(rank, args, world_size):
     model, tokenizer = load(model_name)
 
     
-    # def RecursiveVisit(name, module, upper_module):
-    #     """
-    #     Recursively replace layers in the module with the custom layer.
+    def RecursiveVisit(name, module, upper_module):
+        """
+        Recursively replace layers in the module with the custom layer.
         
-    #     Args:
-    #     - module (nn.Module): The module (or model) to modify.
-    #     - custom_layer_class (nn.Module): The custom layer class to replace with.
-    #     """
+        Args:
+        - module (nn.Module): The module (or model) to modify.
+        - custom_layer_class (nn.Module): The custom layer class to replace with.
+        """
             
-    #     has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
-    #     has_child = any(isinstance(child, nn.Module) for child in module.children())
-    #     is_MultiheadAttention = isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) 
+        has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
+        has_child = any(isinstance(child, nn.Module) for child in module.children())
+        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP) 
+        is_linear = nn.Linear
 
-    #     if has_child and not is_MultiheadAttention:
-    #         for name, child in module.named_children():
-    #             m = RecursiveVisit(name, child, module)
-    #             if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
-    #                 return m
-    #     else:
-    #         return module
+        if has_child and not is_MultiheadAttention:
+            for name, child in module.named_children():
+                m = RecursiveVisit(name, child, module)
+                if isinstance(m, nn.Linear):
+                    return m
+        else:
+            return module
 
-    # attention = RecursiveVisit('name', model, model)
-    attention = nn.Linear(1000, 1000)
-    attention.embed_dim = 1000
+    attention = RecursiveVisit('name', model, model)
+    attention.embed_dim = attention.in_features
     attention = copy.deepcopy(attention)
     ddp_attention = copy.deepcopy(attention)
     fsdp_attention = copy.deepcopy(attention)
@@ -116,7 +116,7 @@ def benchmark_dp(rank, args, world_size):
     num_epochs = 3
     for epoch in range(num_epochs):
         start_time = time.time()
-        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim).cuda()
+        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
         inputs = batch.to(device)
         outputs = attention(inputs)
         DDP_outputs = ddp_attention(inputs)
@@ -125,16 +125,16 @@ def benchmark_dp(rank, args, world_size):
 
         assert torch.allclose(outputs[0], rtp_outputs[0], atol=1e-5), f"{torch.max(outputs[0]-rtp_outputs[0])}"
 
-        # outputs.mean().backward()
-        # rtp_outputs.mean().backward()
+        outputs.mean().backward()
+        rtp_outputs.mean().backward()
         
-        # # all reduce gradient for sp
-        # for p in rtp_attention.parameters():
-        #     p.grad.data = _gather(p.grad, dim=0)
+        # all reduce gradient for sp
+        for p in rtp_attention.parameters():
+            p.grad.data = _gather(p.grad, dim=0)
     
-        # # check grad
-        # for p1, p2 in zip(rtp_attention.parameters(), attention.parameters()):
-        #     assert torch.allclose(p1.grad, p2.grad, atol=1e-3), f"{p1.grad}\nvs\n{p2.grad}"
+        # check grad
+        for p1, p2 in zip(rtp_attention.parameters(), attention.parameters()):
+            assert torch.allclose(p1.grad, p2.grad, atol=1e-3), f"{p1.grad}\nvs\n{p2.grad}"
 
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
