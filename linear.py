@@ -126,6 +126,8 @@ def benchmark_dp(rank, args, world_size):
 
         outputs.mean().backward()
         rtp_outputs.mean().backward()
+        Weight_loss = criterion(Weight_linear_output, cur_label) / world_size
+        Weight_loss.backward()
         
         # all reduce gradient for sp
         for p in rtp_attention.parameters():

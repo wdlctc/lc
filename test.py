@@ -26,6 +26,7 @@ import torch.distributed as dist
 from rtp.rotated_tensor_parallel import RotatedTensorParallel
 
 import copy
+import torch.nn.functional as F
 
 RPC_PORT = 29501
 
@@ -99,9 +100,6 @@ def benchmark_dp(rank, args, world_size):
     print(attention.c_fc)
     attention.embed_dim = attention.c_fc.in_features
     attention = copy.deepcopy(attention)
-    ddp_attention = copy.deepcopy(attention)
-    fsdp_attention = copy.deepcopy(attention)
-    rtp_attention = copy.deepcopy(attention)
 
     del model
     print(attention)
@@ -109,34 +107,32 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
-    ddp_attention = DDP(ddp_attention.to(device))
-    fsdp_attention = FullyShardedDataParallel(fsdp_attention.to(device))
-    rtp_attention = RotatedTensorParallel(rtp_attention.to(device), inplace=False)
-    rtp_attention.eval()
+    # attention.eval()
     
     num_epochs = 3
+    split = 16
+    batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
+    inputs = batch.to(device)
+
     for epoch in range(num_epochs):
         start_time = time.time()
-        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
-        inputs = batch.to(device)
-        outputs = attention(inputs)
-        DDP_outputs = ddp_attention(inputs)
-        fsdp_outputs = fsdp_attention(inputs)
-        rtp_outputs = rtp_attention(inputs)
+        # output_parallel = attention(inputs)
 
-        # assert torch.allclose(outputs[0], rtp_outputs[0], atol=1), f"{(outputs[0],rtp_outputs[0])}"
+        output_parallel = None
 
-        # outputs.mean().backward()
-        # rtp_outputs.mean().backward()
+        for i in range(split):
+            slice1 = slice(
+                attention.c_fc.out_features // split * i,
+                attention.c_fc.out_features // split * (i+1),
+            )
+            outputs =  attention.dropout(F.linear(attention.act(F.linear(inputs, attention.c_fc.weight[slice1],  attention.c_fc.bias[slice1])), attention.c_proj.weight[:, slice1],  attention.c_proj.bias))
+
+            if output_parallel == None:
+                output_parallel = outputs
+            else:
+                output_parallel += outputs
         
-        # # all reduce gradient for sp
-        # for p in rtp_attention.parameters():
-        #     p.grad.data = _gather(p.grad, dim=0)
-    
-        # # check grad
-        # for p1, p2 in zip(rtp_attention.parameters(), attention.parameters()):
-        #     assert torch.allclose(p1.grad, p2.grad, atol=1e-3), f"{p1.grad}\nvs\n{p2.grad}"
-
+        output_parallel.mean().backward()
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
 
