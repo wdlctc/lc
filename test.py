@@ -51,66 +51,171 @@ def init_random_seed(seed: int):
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
 
+def ensure_divisibility(numerator: int, denominator: int) -> None:
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
-def _gather(input_: torch.Tensor, dim) -> torch.Tensor:
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
 
-    # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size() == 1:
-        return input_
+def split_tensor(
+    tensor: torch.Tensor, num_partitions: int, contiguous_split_chunks: bool = False, dim: int = -1
+) -> List[torch.Tensor]:
+    """ Split a tensor along its last dimension.
 
-    # Size and dimension.
-    last_dim = input_.dim() - 1
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                     in memory.
 
-    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-    tensor_list[rank] = input_
-    torch.distributed.all_gather(tensor_list, input_)
+        Returns:
+            A list of Tensors
+    """
+    # Get the size and dimension.
+    dim_size = divide(tensor.size()[dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, dim_size, dim=dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
 
-    # Note: torch.cat already creates a contiguous tensor.
-    output = torch.cat(tensor_list, dim=dim).contiguous()
+    return tensor_list
+    
+def split_number(num, parts):
+    base = num // parts
+    remainder = num % parts
+    result = [base] * parts
+    
+    for i in range(remainder):
+        result[i] += 1
+    
+    return result
 
-    return output
+
+
+class FlyweightWarpper(nn.Module):
+    def __init__(
+        self,
+        sub_models
+    ):
+        super().__init__()
+        self.sub_models = sub_models
+        self.module = sub_models[0]
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        output_parallel = None
+        for sub_model in self.sub_models:
+            outputs = sub_model(*args, **kwargs)
+
+            if output_parallel is None:
+                output_parallel = outputs
+            else:
+                if isinstance(output_parallel, tuple):
+                    output_parallel = tuple( tensor1 + tensor2 if tensor1 is not None and tensor2 is not None else None 
+                                             for tensor1, tensor2 in zip(output_parallel, outputs))
+                else:
+                    output_parallel = output_parallel + outputs
+
+        return output_parallel
+
+class OutputWarpper(nn.Module):
+    def __init__(
+        self,
+        module
+    ):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        input = args[0][:,-1,:]
+        output_parallel = self.module(input)
+
+        return output_parallel
 
 class gpt2warpper(nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        split=12
+        split=2
     ):
         super().__init__()
         self.module = module
-        self.k_proj = copy.deepcopy(self.module.k_proj)
-        self.v_proj = copy.deepcopy(self.module.v_proj)
-        self.q_proj = copy.deepcopy(self.module.q_proj)
-        self.out_proj = copy.deepcopy(self.module.out_proj)
-        self.embed_dim = self.module.embed_dim
         self.split = split
+        self.FlyweightModule_list = []
+        self.RecursiveVisit('module', self.module, self)
 
-        self.module.num_heads = self.module.num_heads // split
+    def RecursiveVisit(self, name, module, upper_module):
+        
+        """
+        Recursively replace layers in the module with the custom layer.
+        
+        Args:
+        - module (nn.Module): The module (or model) to modify.
+        - custom_layer_class (nn.Module): The custom layer class to replace with.
+        """
+            
+        has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
+        has_child = any(isinstance(child, nn.Module) for child in module.children())
+        is_cusomized = isinstance(module, nn.MultiheadAttention) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention)  or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP) 
 
+        if has_child and not is_cusomized:
+            for name, child in module.named_children():
+                self.RecursiveVisit(name, child, module)
+        else:
+            if has_parameters:
+                if isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP):
+                    sub_modules = []
+                    for i in range(self.split):
+                        sub_module = copy.deepcopy(module)
 
+                        sub_module.c_fc.weight = nn.Parameter(split_tensor(module.c_fc.weight, self.split, dim=0)[i])
+                        if module.c_fc.bias is not None:
+                            sub_module.c_fc.bias = nn.Parameter(split_tensor(module.c_fc.bias, self.split, dim=0)[i])
+                        
+                        sub_module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.split, dim=1)[i])
+                        if sub_module.c_proj.bias is not None:
+                            sub_module.c_proj.bias.data.div_(self.split)
+                        
+                        sub_modules.append(sub_module)
+
+                    module = FlyweightWarpper(sub_modules)
+                    setattr(upper_module, name, module)
+                    self.FlyweightModule_list.append(module)
+                    
+                elif isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention):
+                    sub_modules = []
+                    for i in range(self.split):
+                        sub_module = copy.deepcopy(module)
+                        
+                        sub_module.q_proj.weight = nn.Parameter(split_tensor(module.q_proj.weight, self.split, dim=0)[i])
+                            
+                        sub_module.k_proj.weight = nn.Parameter(split_tensor(module.k_proj.weight, self.split, dim=0)[i])
+                        
+                        sub_module.v_proj.weight = nn.Parameter(split_tensor(module.v_proj.weight, self.split, dim=0)[i])
+        
+                        sub_module.out_proj.weight = nn.Parameter(split_tensor(module.out_proj.weight, self.split, dim=1)[i])
+                        if sub_module.out_proj.bias is not None:
+                            sub_module.out_proj.bias.data.div_(self.split)
+                            
+                        sub_module.num_heads = sub_module.num_heads // self.split
+                        sub_modules.append(sub_module)
+
+                    module = FlyweightWarpper(sub_modules)
+                    setattr(upper_module, name, module)
+                    self.FlyweightModule_list.append(module)
+                elif isinstance(module, nn.Linear):
+                    module = OutputWarpper(module)
+                    setattr(upper_module, name, module)
+                    self.FlyweightModule_list.append(module)
+    
+        
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-
-        output_parallel = None
-        for i in range(self.split):
-            slice1 = slice(
-                self.embed_dim // self.split * i,
-                self.embed_dim // self.split * (i+1),
-            )
-            self.module.k_proj.weight.data = self.k_proj.weight.data[slice1]
-            self.module.v_proj.weight.data = self.v_proj.weight.data[slice1]
-            self.module.q_proj.weight.data = self.q_proj.weight.data[slice1]
-            self.module.out_proj.weight.data = self.out_proj.weight.data[:,slice1]
-
-            outputs = self.module(*args, **kwargs)
-
-            if output_parallel is None:
-                output_parallel = outputs
-            else:
-                output_parallel += outputs
-
-        return output_parallel
+        outputs = self.module(*args, **kwargs)
+        return outputs
     
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
@@ -129,54 +234,22 @@ def benchmark_dp(rank, args, world_size):
     model, tokenizer = load(model_name)
     model.eval()
 
-    
-    def RecursiveVisit(name, module, upper_module):
-        """
-        Recursively replace layers in the module with the custom layer.
-        
-        Args:
-        - module (nn.Module): The module (or model) to modify.
-        - custom_layer_class (nn.Module): The custom layer class to replace with.
-        """
-            
-        has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
-        has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention) 
-
-        if has_child and not is_MultiheadAttention:
-            for name, child in module.named_children():
-                m = RecursiveVisit(name, child, module)
-                if isinstance(m, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention):
-                    return m
-        else:
-            return module
-
-    attention = RecursiveVisit('name', model, model)
-    attention = copy.deepcopy(attention)
-    cf = attention.config
-    cf.max_position_embeddings = 32000
-
-    del attention
-    
-    attention = transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention(cf, 'none')
-    attention = gpt2warpper(attention)
-    
-    del model
-    
     # Move the model to GPU(s)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    attention.to(device)
-    # rtp_attention.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "CPU")
+    model.to(device)
+
+    # model = gpt2warpper(copy.deepcopy(model), split=12)
+    print(model)
     
-    num_epochs = 2
+    num_epochs = 5
     init_random_seed(0)
-    batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim).cuda()
+    batch = torch.tensor(np.random.randint(low=0, high=len(tokenizer), size=(args.batch_size, args.max_length,)))
     inputs = batch.to(device)
     with torch.no_grad():
         for epoch in range(num_epochs):
             start_time = time.time()
-            print(inputs.shape)
-            outputs = attention(hidden_states=inputs)
+            outputs = model(input_ids=inputs)
+            
             
             epoch_time = time.time() - start_time
             print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
@@ -203,7 +276,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=5
+        "--max_length", type=int, default=64
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
