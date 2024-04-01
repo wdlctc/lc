@@ -128,9 +128,6 @@ def benchmark_dp(rank, args, world_size):
 
         assert torch.allclose(outputs[0], rtp_outputs[0], atol=1e-3), f"{torch.max((outputs[0] - rtp_outputs[0]))}"
 
-        outputs[0].mean().backward()
-        rtp_outputs[0].mean().backward()
-        
 
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")

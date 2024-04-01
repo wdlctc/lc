@@ -26,22 +26,7 @@ import torch.distributed as dist
 from rtp.rotated_tensor_parallel import RotatedTensorParallel
 
 import copy
-
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    Generator,
-    Iterator,
-    List,
-    Mapping,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
+import torch.nn.functional as F
 
 RPC_PORT = 29501
 
@@ -72,46 +57,6 @@ def _gather(input_: torch.Tensor, dim) -> torch.Tensor:
 
     return output
 
-class gpt2warpper(nn.Module):
-    def __init__(
-        self,
-        module: nn.Module,
-        split=12
-    ):
-        super().__init__()
-        self.module = module
-        self.k_proj = copy.deepcopy(self.module.k_proj)
-        self.v_proj = copy.deepcopy(self.module.v_proj)
-        self.q_proj = copy.deepcopy(self.module.q_proj)
-        self.out_proj = copy.deepcopy(self.module.out_proj)
-        self.embed_dim = self.module.embed_dim
-        self.split = split
-
-        self.module.num_heads = self.module.num_heads // split
-
-
-    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-
-        output_parallel = None
-        for i in range(self.split):
-            slice1 = slice(
-                self.embed_dim // self.split * i,
-                self.embed_dim // self.split * (i+1),
-            )
-            self.module.k_proj.weight.data = self.k_proj.weight.data[slice1]
-            self.module.v_proj.weight.data = self.v_proj.weight.data[slice1]
-            self.module.q_proj.weight.data = self.q_proj.weight.data[slice1]
-            self.module.out_proj.weight.data = self.out_proj.weight.data[:,slice1]
-
-            outputs = self.module(*args, **kwargs)
-
-            if output_parallel is None:
-                output_parallel = outputs
-            else:
-                output_parallel += outputs
-
-        return output_parallel
-    
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
@@ -127,7 +72,6 @@ def benchmark_dp(rank, args, world_size):
     
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
-    model.eval()
 
     
     def RecursiveVisit(name, module, upper_module):
@@ -141,46 +85,62 @@ def benchmark_dp(rank, args, world_size):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention) 
+        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP)
+        is_linear = nn.Linear
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 m = RecursiveVisit(name, child, module)
-                if isinstance(m, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention):
+                if isinstance(m, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP):
                     return m
         else:
             return module
 
     attention = RecursiveVisit('name', model, model)
+    print(attention.c_fc)
+    attention.embed_dim = attention.c_fc.in_features
     attention = copy.deepcopy(attention)
-    cf = attention.config
-    cf.max_position_embeddings = 32000
 
-    del attention
-    
-    attention = transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention(cf, 'none')
-    attention = gpt2warpper(attention)
-    
     del model
+    print(attention)
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
-    # rtp_attention.eval()
+    # attention.eval()
     
-    num_epochs = 2
-    init_random_seed(0)
-    batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim).cuda()
+    num_epochs = 1
+    split = 8
+    batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
     inputs = batch.to(device)
+    
     with torch.no_grad():
         for epoch in range(num_epochs):
             start_time = time.time()
-            print(inputs.shape)
-            outputs = attention(hidden_states=inputs)
+            output_parallel = attention(inputs)
+    
+            # output_parallel = None
+    
+            # for i in range(split):
+            #     slice1 = slice(
+            #         attention.c_fc.out_features // split * i,
+            #         attention.c_fc.out_features // split * (i+1),
+            #     )
+            #     outputs =  attention.dropout(F.linear(attention.act(F.linear(inputs, attention.c_fc.weight[slice1],  attention.c_fc.bias[slice1])), attention.c_proj.weight[:, slice1],  attention.c_proj.bias))
+    
+            #     if output_parallel == None:
+            #         output_parallel = outputs
+            #     else:
+            #         output_parallel += outputs
+            
+            # # output_parallel.mean().backward()
+
             
             epoch_time = time.time() - start_time
             print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
     
+            print(output_parallel)
+
 
     print(
         "Peak allocated bytes on cuda:{}: {:4f}GB".format(
@@ -203,7 +163,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=5
+        "--max_length", type=int, default=512
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
