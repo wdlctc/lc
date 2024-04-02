@@ -160,7 +160,7 @@ class gpt2warpper(nn.Module):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_cusomized = isinstance(module, nn.MultiheadAttention) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention)  or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP) 
+        is_cusomized = isinstance(module, nn.MultiheadAttention) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention)  or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP) or isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention)  or  isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP)  
 
         if has_child and not is_cusomized:
             for name, child in module.named_children():
@@ -207,6 +207,47 @@ class gpt2warpper(nn.Module):
                     module = FlyweightWarpper(sub_modules)
                     setattr(upper_module, name, module)
                     self.FlyweightModule_list.append(module)
+                elif isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+                    sub_modules = []
+                    for i in range(self.split):
+                        sub_module = copy.deepcopy(module)
+                        sub_module.q_proj.weight = nn.Parameter(split_tensor(module.q_proj.weight, self.split, dim=0)[i])
+                        if sub_module.q_proj.bias is not None:
+                            sub_module.q_proj.bias = nn.Parameter(split_tensor(module.q_proj.bias, self.split, dim=0)[i])
+                        
+                        sub_module.k_proj.weight = nn.Parameter(split_tensor(module.k_proj.weight, self.split, dim=0)[i])
+                        if sub_module.k_proj.bias is not None:
+                            sub_module.k_proj.bias = nn.Parameter(split_tensor(module.k_proj.bias, self.split, dim=0)[i])
+                            
+                        sub_module.v_proj.weight = nn.Parameter(split_tensor(module.v_proj.weight, self.split, dim=0)[i])
+                        if sub_module.v_proj.bias is not None:
+                            sub_module.v_proj.bias = nn.Parameter(split_tensor(module.v_proj.bias, self.split, dim=0)[i])
+                            
+                        sub_module.o_proj.weight = nn.Parameter(split_tensor(module.o_proj.weight, self.split, dim=1)[i])
+                        
+                        sub_module.num_heads = module.num_heads // self.split
+                        sub_module.num_key_value_heads = module.num_key_value_heads // self.split
+                        sub_module.hidden_size = module.hidden_size // self.split
+                        sub_modules.append(sub_module)
+
+                    module = FlyweightWarpper(sub_modules)
+                    setattr(upper_module, name, module)
+                    self.FlyweightModule_list.append(module)
+                elif isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP):
+                    sub_modules = []
+                    for i in range(self.split):
+                        sub_module = copy.deepcopy(module)
+                        sub_module.up_proj.weight = nn.Parameter(split_tensor(module.up_proj.weight, self.split, dim=0)[i])
+                            
+                        sub_module.gate_proj.weight = nn.Parameter(split_tensor(module.gate_proj.weight, self.split, dim=0)[i])
+                        
+                        sub_module.down_proj.weight = nn.Parameter(split_tensor(module.down_proj.weight, self.split, dim=1)[i])
+                        
+                        sub_modules.append(sub_module)
+    
+                    module = FlyweightWarpper(sub_modules)
+                    setattr(upper_module, name, module)
+                    self.FlyweightModule_list.append(module)
                 elif isinstance(module, nn.Linear):
                     module = OutputWarpper(module)
                     setattr(upper_module, name, module)
@@ -238,7 +279,11 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "CPU")
     model.to(device)
 
-    # model = gpt2warpper(copy.deepcopy(model), split=12)
+    # ref_model = copy.deepcopy(model)
+
+    # model = copy.deepcopy(model)
+
+    # model = gpt2warpper(model, split=4)
     print(model)
     
     num_epochs = 5
@@ -248,9 +293,11 @@ def benchmark_dp(rank, args, world_size):
     with torch.no_grad():
         for epoch in range(num_epochs):
             start_time = time.time()
-            outputs = model(input_ids=inputs)
+            output_parallel = model(input_ids=inputs)
+            # output_ref = ref_model(input_ids=inputs, past_key_values=None, use_cache=False)
             
-            
+            # assert torch.allclose(output_ref.logits, output_parallel.logits, atol=1e-3), f"{torch.max(output_ref.logits-output_parallel.logits), output_ref.logits,output_parallel.logits}"
+            output_parallel = None
             epoch_time = time.time() - start_time
             print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
     
