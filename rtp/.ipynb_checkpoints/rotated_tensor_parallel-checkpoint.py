@@ -415,6 +415,7 @@ class RotatedTensorParallel(nn.Module):
         self.FlyweightModule_list = []
         self.RecursiveVisit('module', self.module, self)
         self.e = False
+        self.optimizer_dict = None
         
     def RecursiveVisit(self, name, module, upper_module):
         """
@@ -590,6 +591,10 @@ class RotatedTensorParallel(nn.Module):
                 else:
                     print(module, type(module))
 
+    def set_optimizer_dict(self, optimizer_dict, optimizer_hook):
+        self.optimizer_dict = optimizer_dict
+        self.optimizer_hook = optimizer_hook
+    
     def eval(self):
         self.e = True
         for module in self.FlyweightModule_list:
@@ -606,7 +611,20 @@ class RotatedTensorParallel(nn.Module):
         for module in self.FlyweightModule_list:
             for i, sub_module in enumerate(module.module_list):
                 if i == self.rank:
-                    continue
+                    if self.optimizer_dict is None:
+                        continue
+                    else:
+                        for p in sub_module.parameters():
+                            if p.requires_grad:
+                                # Register a hook.
+                                p_tmp = p.expand_as(p)  # Get a grad_fn on p_tmp.
+                                assert p_tmp.grad_fn is not None
+                                grad_acc = p_tmp.grad_fn.next_functions[0][0]  # Gets its GradAccumulation object.
+        
+                                if self.inplace:
+                                    handle = grad_acc.register_hook(partial(self.optimizer_hook, p))
+                        continue
+                        
                 sub_module.count = 0
                 for p in sub_module.parameters():
                     if p.requires_grad:

@@ -58,7 +58,14 @@ def benchmark_dp(rank, args, world_size):
     
     print(model)
     
-    optimizer = AdamW(model.parameters(), lr=5e-5)
+    # optimizer = AdamW(model.parameters(), lr=5e-5)
+    optimizer_dict = {p: torch.optim.Adam([p], foreach=False) for p in model.parameters()}
+    def optimizer_hook(parameter) -> None:
+        optimizer_dict[parameter].step()
+        optimizer_dict[parameter].zero_grad()
+
+    model.set_optimizer_dict(optimizer_dict, optimizer_hook)
+    
     
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
@@ -94,11 +101,9 @@ def benchmark_dp(rank, args, world_size):
     
         for batch in data_loader:
             inputs = batch.to(device)
-            outputs = model(input_ids=inputs, labels=inputs)
+            outputs = model(input_ids=inputs, labels=inputs, use_cache=False)
             loss = outputs.loss
             loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
             total_loss += loss.item()
     
         avg_loss = total_loss / len(data_loader)

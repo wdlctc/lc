@@ -5,6 +5,7 @@ import time
 import tempfile
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from torch.optim import AdamW
@@ -18,8 +19,12 @@ import numpy as np
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel
+from torch.distributed.fsdp.wrap import CustomPolicy
 import torch.multiprocessing as mp
 import torch.distributed as dist
+
+import transformers
+from functools import partial
 
 RPC_PORT = 29501
 
@@ -28,7 +33,67 @@ def init_random_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
+
+def lambda_fn(module: nn.Module):
+    if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP):
+        return True
+    return False
+
+
+def hook_fn(param, *unused):
+    if param.grad is None:
+        return
+    print('test', param.grad.shape)
+    param.lora_grad = param.grad[0:5]
+    param.grad = None
+
+class warpper(nn.Module):
+    def __init__(
+        self,
+        module: nn.Module,
+    ):
+        super().__init__()
+        self.module = module
+        
+    def forward(self, *args, **kwargs):
+        outputs = self.module(*args, **kwargs)
+        self._register_post_backward_hooks()
+        return outputs
+
+    def _register_post_backward_hooks(self) -> None:
+        if not torch.is_grad_enabled():
+            return  # don't register grad hooks if grad isn't enabled
+        for p in self.module.parameters():
+            if p.requires_grad:
+                # Register a hook.
+                p_tmp = p.expand_as(p)  # Get a grad_fn on p_tmp.
+                assert p_tmp.grad_fn is not None
+                grad_acc = p_tmp.grad_fn.next_functions[0][0]  # Gets its GradAccumulation object.
+
+                handle = grad_acc.register_hook(partial(hook_fn, p))
+                p._post_backward_hook_state = (grad_acc, handle)
+
+# def RecursiveVisit(name, module, upper_module):
     
+#     """
+#     Recursively replace layers in the module with the custom layer.
+    
+#     Args:
+#     - module (nn.Module): The module (or model) to modify.
+#     - custom_layer_class (nn.Module): The custom layer class to replace with.
+#     """
+        
+#     has_child = any(isinstance(child, nn.Module) for child in module.children())
+#     is_cusomized = isinstance(module, FullyShardedDataParallel) and not (module is upper_module)
+
+#     if has_child and not is_cusomized:
+#         for name, child in module.named_children():
+#             RecursiveVisit(name, child, module)
+#     else:
+#         if is_cusomized:
+#             module = warpper(module)
+#             setattr(upper_module, name, module)
+
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
@@ -48,8 +113,10 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    
-    model = FullyShardedDataParallel(model)
+
+    policy = CustomPolicy(lambda_fn)
+    model = FullyShardedDataParallel(model, auto_wrap_policy=policy)
+    print(model)
     
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
@@ -86,9 +153,9 @@ def benchmark_dp(rank, args, world_size):
     
         for batch in data_loader:
             inputs = batch.to(device)
-            outputs = model(input_ids=inputs, labels=inputs, use_cache=False, past_key_values=None)
+            outputs = model(input_ids=inputs, labels=inputs, use_cache=False)
             loss = outputs.loss
-            loss.backward()
+            loss.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
             total_loss += loss.item()
