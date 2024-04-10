@@ -19,22 +19,25 @@ import numpy as np
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
 import torch.distributed as dist
-import deepspeed
 
-RPC_PORT = 29505
+from rtp.ulysses import RotatedTensorParallel
+
+RPC_PORT = 29501
 
 def init_random_seed(seed: int):
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
-    
+
+
+
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
-    # torch.distributed.init_process_group(
-    #     backend="nccl", rank=rank, world_size=world_size, init_method=init_method_pgroup
-    # )
+    torch.distributed.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size, init_method=init_method_pgroup
+    )
 
     torch.cuda.set_device(rank)
     init_random_seed(0)
@@ -48,6 +51,21 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    
+    model = RotatedTensorParallel(model)
+
+    model.train()
+    
+    print(model)
+    
+    # optimizer = AdamW(model.parameters(), lr=5e-5)
+    optimizer_dict = {p: torch.optim.Adam([p], foreach=False) for p in model.parameters()}
+    def optimizer_hook(parameter) -> None:
+        optimizer_dict[parameter].step()
+        optimizer_dict[parameter].zero_grad()
+
+    model.set_optimizer_dict(optimizer_dict, optimizer_hook)
+    
     
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
@@ -68,40 +86,11 @@ def benchmark_dp(rank, args, world_size):
     num_samples = args.num_samples  # Number of random samples you want to generate
     max_length = args.max_length  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
-
-    batch_size = args.batch_size
-    # DataLoader
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # Initialize DeepSpeed
-    deepspeed_config = {
-        "train_batch_size": batch_size,
-        "optimizer": {
-            "type": "Adam",
-            "params": {
-                "lr": 5e-5
-            }
-        },
-        "zero_optimization": {
-            "stage": 3,
-            "allgather_partitions": True,
-            "allgather_bucket_size": 5e8,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "contiguous_gradients": True
-        },
-        "dump_state": False,
-        "steps_per_print": 1000000,
-    }
-
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-        args=None,
-        model=model,
-        model_parameters=model.parameters(),
-        config=deepspeed_config
-    )
     
+    # DataLoader
+    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    init_random_seed(0)
     # Set up the optimizer
     # Training loop
     num_epochs = 3
@@ -112,10 +101,9 @@ def benchmark_dp(rank, args, world_size):
     
         for batch in data_loader:
             inputs = batch.to(device)
-            outputs = model_engine(input_ids=inputs, labels=inputs)
+            outputs = model(input_ids=inputs, labels=inputs, use_cache=False)
             loss = outputs.loss
-            model_engine.backward(loss)
-            model_engine.step()
+            loss.backward()
             total_loss += loss.item()
     
         avg_loss = total_loss / len(data_loader)
@@ -138,7 +126,7 @@ if __name__ == "__main__":
         "--dataset_name", type=str, default="yelp_review_full"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=2
+        "--batch_size", type=int, default=1
     )
     parser.add_argument(
         "--num_samples", type=int, default=10
@@ -146,7 +134,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_length", type=int, default=512
     )
-    parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
     
@@ -154,4 +141,9 @@ if __name__ == "__main__":
     num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
     print(torch.cuda.device_count())
 
-    benchmark_dp(args.local_rank, args, num_devices)
+    mp.spawn(
+        benchmark_dp,
+        args=(args, num_devices),
+        nprocs=num_devices,
+        join=True,
+    )
