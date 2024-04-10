@@ -157,6 +157,7 @@ def main(args):
 
     step = 0
     num_epochs = 3
+    update_time = time.time()
     for epoch in range(num_epochs):
         model.train()
         for batch in dataloader:
@@ -179,13 +180,18 @@ def main(args):
                     model, preprocess_batched, pad_idx, device, args.batch_size
                 )
                 print(total_loss)
+                print(
+                    "Peak allocated bytes on {:4f}GB".format(
+                        torch.cuda.memory_stats(0)["allocated_bytes.all.peak"] / 2**30
+                    )
+                )
+                    
+                print(time.time() - update_time)
+                
+                update_time = time.time()
+                return() 
     
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
-    print(
-        "Peak allocated bytes on {:4f}GB".format(
-            torch.cuda.memory_stats(0)["allocated_bytes.all.peak"] / 2**30
-        )
-    )
 
 
 if __name__ == "__main__":

@@ -180,6 +180,7 @@ def benchmark_dp(rank, args, world_size):
 
     step = 0
     num_epochs = 3
+    update_time = time.time()
     for epoch in range(num_epochs):
         model.train()
         for batch in dataloader:
@@ -202,6 +203,18 @@ def benchmark_dp(rank, args, world_size):
                     model, preprocess_batched, pad_idx, rank, world_size, device, args.batch_size
                 )
                 print(total_loss)
+    
+                print(
+                    "Peak allocated bytes on cuda:{}: {:4f}GB".format(
+                        dist.get_rank(), torch.cuda.memory_stats(dist.get_rank())["allocated_bytes.all.peak"] / 2**30
+                    )
+                )
+                    
+                print(time.time() - update_time)
+                
+                update_time = time.time()
+                if step // args.eval_every == 2:
+                    return() 
     
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
     print(
