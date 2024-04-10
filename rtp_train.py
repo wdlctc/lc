@@ -26,6 +26,15 @@ import datasets.distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
+from rtp.rotated_tensor_parallel import RotatedTensorParallel
+
+def init_random_seed(seed: int):
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+
+
 class PreprocessedIterableDataset(IterableDataset):
     def __init__(self, data, tokenizer, batch_size, max_length):
         super().__init__()
@@ -88,6 +97,7 @@ def batch_fn(dataset, batch_size):
         yield batch
         
 def evaluate_model(model, preprocess_batched, pad_idx, rank, world_size, device, batch_size):
+    model.eval()
     _time = time.time()
     val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True)
     val_data = val_data.shuffle(seed=42)
@@ -125,6 +135,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, rank, world_size, device,
     dist.all_gather(gathered_losses, total_loss)
     total_loss = sum([t.item() for t in gathered_losses]) 
 
+    model.train()
     return total_loss, evaluated_on_tokens 
 
 RPC_PORT = 29501
@@ -140,6 +151,7 @@ def benchmark_dp(rank, args, world_size):
     torch.cuda.set_device(rank)
     # Specify the pretrained model name or path
     model_name = args.model_name
+    init_random_seed(0)
     
     # Load the tokenizer and pretrained model
     tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
@@ -151,10 +163,10 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    model = DDP(model)
+    model = RotatedTensorParallel(model)
     
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    # trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     
     # Instantiate the dataset
     num_samples = args.num_samples  # Number of random samples you want to generate
@@ -162,9 +174,9 @@ def benchmark_dp(rank, args, world_size):
 
     # Load the "allenai/c4" dataset with streaming=True
     dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
-    dataset = datasets.distributed.split_dataset_by_node(
-        dataset, rank=rank, world_size=world_size,
-    )
+    # dataset = datasets.distributed.split_dataset_by_node(
+    #     dataset, rank=rank, world_size=world_size,
+    # )
     dataset = PreprocessedIterableDataset(dataset, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
 
@@ -178,6 +190,15 @@ def benchmark_dp(rank, args, world_size):
         )
         return batch
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_dict = {p: torch.optim.Adam([p], foreach=False, lr=args.lr, weight_decay=args.weight_decay) for p in trainable_params}
+    def optimizer_hook(parameter, *unused) -> None:
+        optimizer_dict[parameter].step()
+        optimizer_dict[parameter].zero_grad()
+
+    model.set_optimizer_dict(optimizer_dict, optimizer_hook)
+    
+    print(model)
     step = 0
     num_epochs = 3
     for epoch in range(num_epochs):
@@ -193,8 +214,9 @@ def benchmark_dp(rank, args, world_size):
             outputs = model(**batch, labels=labels, use_cache=False)
             loss = outputs.loss
             loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+
+            # optimizer.step()
+            # optimizer.zero_grad()
             
             if step % args.eval_every == 0:
                 print(f"Performing evaluation at step {step}")

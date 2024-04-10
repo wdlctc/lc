@@ -538,8 +538,6 @@ class RotatedTensorParallel(nn.Module):
                     module.num_key_value_heads = module.num_key_value_heads // self.world_size
                     module.hidden_size = module.hidden_size // self.world_size
 
-                    print(module.num_heads, module.head_dim)
-                    
                     module = FlyweightWarpper(module, self.group, cat_output=False)
 
                     setattr(upper_module, name, module)
@@ -589,7 +587,7 @@ class RotatedTensorParallel(nn.Module):
                 elif isinstance(module, torch.nn.modules.normalization.LayerNorm):
                     pass
                 else:
-                    print(module, type(module))
+                    pass
 
     def set_optimizer_dict(self, optimizer_dict, optimizer_hook):
         self.optimizer_dict = optimizer_dict
@@ -600,9 +598,15 @@ class RotatedTensorParallel(nn.Module):
         for module in self.FlyweightModule_list:
             module.e = True
 
+    def train(self):
+        self.e = False
+        for module in self.FlyweightModule_list:
+            module.e = False
+
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
-        self._register_post_backward_hooks()
+        if not self.e:
+            self._register_post_backward_hooks()
         return outputs
 
     def _register_post_backward_hooks(self) -> None:
@@ -621,8 +625,7 @@ class RotatedTensorParallel(nn.Module):
                                 assert p_tmp.grad_fn is not None
                                 grad_acc = p_tmp.grad_fn.next_functions[0][0]  # Gets its GradAccumulation object.
         
-                                if self.inplace:
-                                    handle = grad_acc.register_hook(partial(self.optimizer_hook, p))
+                                handle = grad_acc.register_hook(partial(self.optimizer_hook, p))
                         continue
                         
                 sub_module.count = 0
