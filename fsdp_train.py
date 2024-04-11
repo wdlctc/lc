@@ -151,7 +151,7 @@ def benchmark_dp(rank, args, world_size):
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model = model.to(device=device, dtype=torch.bfloat16)
     model = FullyShardedDataParallel(model)
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]

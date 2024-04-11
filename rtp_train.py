@@ -162,9 +162,10 @@ def benchmark_dp(rank, args, world_size):
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model = RotatedTensorParallel(model)
     
+    model = model.to(device=device, dtype=torch.bfloat16)
+    
+    model = RotatedTensorParallel(model)
     
     # Instantiate the dataset
     num_samples = args.num_samples  # Number of random samples you want to generate
@@ -188,16 +189,16 @@ def benchmark_dp(rank, args, world_size):
         )
         return batch
 
-    # trainable_params = [p for p in model.parameters() if p.requires_grad]
-    # optimizer_dict = {p: torch.optim.Adam([p], foreach=False, lr=args.lr, weight_decay=args.weight_decay) for p in trainable_params}
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_dict = {p: torch.optim.Adam([p], foreach=False, lr=args.lr, weight_decay=args.weight_decay) for p in trainable_params}
+    model.set_optimizer_dict(optimizer_dict)
     # def optimizer_hook(parameter, *unused) -> None:
     #     optimizer_dict[parameter].step()
     #     optimizer_dict[parameter].zero_grad()
 
-    # model.set_optimizer_dict(optimizer_dict, optimizer_hook)
     
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    # trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     
     print(model)
     step = 0
@@ -217,8 +218,8 @@ def benchmark_dp(rank, args, world_size):
             loss = outputs.loss
             loss.backward()
 
-            optimizer.step()
-            optimizer.zero_grad()
+            # optimizer.step()
+            # optimizer.zero_grad()
             
             if step % args.eval_every == 0:
                 print(f"Performing evaluation at step {step}")
