@@ -39,6 +39,19 @@ def hook_fn_inplace(sub_module, module, *unused: Any):
         if module.e:
             module.rank = (module.rank + module.world_size - 1 +module.world_size) % module.world_size
 
+
+def hook_fn_optimizer(sub_module, module, rtp, *unused: Any):
+    sub_module.count -= 1
+    if sub_module.count == 0:
+        for p in sub_module.parameters():
+            # if p.grad is not None:
+            rtp.optimizer_dict[p].step()
+            rtp.optimizer_dict[p].zero_grad()
+
+    for sub_module in module.module_list:
+        for param in sub_module.parameters():
+            param.grad = None
+
 def ensure_divisibility(numerator: int, denominator: int) -> None:
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
@@ -589,9 +602,8 @@ class RotatedTensorParallel(nn.Module):
                 else:
                     pass
 
-    def set_optimizer_dict(self, optimizer_dict, optimizer_hook):
+    def set_optimizer_dict(self, optimizer_dict):
         self.optimizer_dict = optimizer_dict
-        self.optimizer_hook = optimizer_hook
     
     def eval(self):
         self.e = True
@@ -618,14 +630,17 @@ class RotatedTensorParallel(nn.Module):
                     if self.optimizer_dict is None:
                         continue
                     else:
+                        sub_module.count = 0
                         for p in sub_module.parameters():
                             if p.requires_grad:
-                                # Register a hook.
                                 p_tmp = p.expand_as(p)  # Get a grad_fn on p_tmp.
                                 assert p_tmp.grad_fn is not None
                                 grad_acc = p_tmp.grad_fn.next_functions[0][0]  # Gets its GradAccumulation object.
-        
-                                handle = grad_acc.register_hook(partial(self.optimizer_hook, p))
+                                sub_module.count += 1
+
+                                if  not hasattr(p, '_test_handle'):
+                                    handle = grad_acc.register_hook(partial(hook_fn_optimizer, sub_module, module, self))
+                                    p._test_handle = handle
                         continue
                         
                 sub_module.count = 0
@@ -640,4 +655,6 @@ class RotatedTensorParallel(nn.Module):
                         if self.inplace:
                             handle = grad_acc.register_hook(partial(hook_fn_inplace, sub_module, module))
                         else:
-                            handle = grad_acc.register_hook(partial(hook_fn, sub_module, module))
+                            if  not hasattr(p, '_my_handle'):
+                                handle = grad_acc.register_hook(partial(hook_fn, sub_module, module))
+                                p._my_handle = handle

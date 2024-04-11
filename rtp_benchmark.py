@@ -59,12 +59,11 @@ def benchmark_dp(rank, args, world_size):
     print(model)
     
     # optimizer = AdamW(model.parameters(), lr=5e-5)
-    optimizer_dict = {p: torch.optim.Adam([p], foreach=False) for p in model.parameters()}
-    def optimizer_hook(parameter) -> None:
-        optimizer_dict[parameter].step()
-        optimizer_dict[parameter].zero_grad()
-
-    model.set_optimizer_dict(optimizer_dict, optimizer_hook)
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_dict = {p: torch.optim.Adam([p], foreach=False) for p in trainable_params}
+    
+    model.set_optimizer_dict(optimizer_dict)
     
     
     # Random data generator dataset class
