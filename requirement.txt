@@ -2,4 +2,3 @@ torch
 transformers
 datasets
 deepspeed
-peft_pretraining
