@@ -48,39 +48,6 @@ def init_random_seed(seed: int):
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
 
-def ensure_divisibility(numerator: int, denominator: int) -> None:
-    """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
-
-def divide(numerator, denominator):
-    """Ensure that numerator is divisible by the denominator and return
-    the division value."""
-    ensure_divisibility(numerator, denominator)
-    return numerator // denominator
-
-def split_tensor(
-    tensor: torch.Tensor, num_partitions: int, contiguous_split_chunks: bool = False, dim: int = -1
-) -> List[torch.Tensor]:
-    """ Split a tensor along its last dimension.
-
-        Arguments:
-            tensor: input tensor.
-            num_partitions: number of partitions to split the tensor
-            contiguous_split_chunks: If True, make each chunk contiguous
-                                     in memory.
-
-        Returns:
-            A list of Tensors
-    """
-    # Get the size and dimension.
-    dim_size = divide(tensor.size()[dim], num_partitions)
-    # Split.
-    tensor_list = torch.split(tensor, dim_size, dim=dim)
-    # Note: torch.split does not create contiguous tensors by default.
-    if contiguous_split_chunks:
-        return tuple(chunk.contiguous() for chunk in tensor_list)
-
-    return tensor_list
 
 def _gather_along_first_dim(input_):
     """Gather tensors and concatinate along the first dimension."""
@@ -101,27 +68,27 @@ def _gather_along_first_dim(input_):
 
     return output
 
-def _reduce_scatter_along_first_dim(input_):
-    """Reduce-scatter the input tensor across model parallel group."""
+def _split_along_first_dim(input_):
+    """Split the tensor along its first dimension and keep the
+    corresponding slice."""
     group = torch.distributed.distributed_c10d._get_default_group()
     world_size = torch.distributed.get_world_size(group=group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
 
-    dim_size = list(input_.size())
+    # Split along first dimension.
+    dim_size = input_.size()[1]
     assert (
-        dim_size[1] % world_size == 0
+        dim_size % world_size == 0
     ), "First dimension of the tensor should be divisible by tensor parallel size"
+    local_dim_size = dim_size // world_size
+    rank = torch.distributed.get_rank(group=group)
+    dim_offset = rank * local_dim_size
 
-    dim_size[1] = dim_size[1] // world_size
+    output = input_[:, dim_offset : dim_offset + local_dim_size].contiguous()
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-    torch.distributed._reduce_scatter_base(
-        output, input_.contiguous(), group=group
-    )
     return output
-    
     
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     """Gather the input from sequence parallel region and concatinate."""
@@ -138,18 +105,18 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         tensor_parallel_output_grad = ctx.tensor_parallel_output_grad
-        return _reduce_scatter_along_first_dim(grad_output), None
+        return _split_along_first_dim(grad_output), None
         
-class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
-    """Reduce scatter the input from the model parallel region."""
+class _ScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Split the input and keep only the corresponding chuck to the rank."""
 
     @staticmethod
     def symbolic(graph, input_):
-        return _reduce_scatter_along_first_dim(input_)
+        return _split_along_first_dim(input_)
 
     @staticmethod
     def forward(ctx, input_):
-        return _reduce_scatter_along_first_dim(input_)
+        return _split_along_first_dim(input_)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -166,16 +133,15 @@ class SequenceWarpper(nn.Module):
         self.group = group
         
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-
-        inputs = _GatherFromSequenceParallelRegion.apply(args[0])
-        outputs = self.module(inputs, **kwargs)
-        if isinstance(outputs, tuple):
-            outputs = list(outputs)
-            outputs[0] = _ReduceScatterToSequenceParallelRegion.apply(outputs[0])
-            outputs = tuple(outputs)
+        if args:
+            inputs = _GatherFromSequenceParallelRegion.apply(args[0])
+            outputs = self.module(inputs, **kwargs)
         else:
-            outputs = _ReduceScatterToSequenceParallelRegion.apply(outputs)
-            
+            kwargs['hidden_states'] = _GatherFromSequenceParallelRegion.apply(kwargs['hidden_states'])
+            outputs = self.module(*args, **kwargs)
+        outputs = list(outputs)
+        outputs[0] = _ScatterToSequenceParallelRegion.apply(outputs[0])
+        outputs = tuple(outputs)
         return outputs
         
 class SequenceParallel(nn.Module):
@@ -203,38 +169,14 @@ class SequenceParallel(nn.Module):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP)
+        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention)
         is_linear = nn.Linear
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 self.RecursiveVisit(name, child, module)
         else:
-            if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
-            
-                if module.c_attn is not None:
-                    module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
-                    if module.c_attn.bias is not None:
-                        module.c_attn.bias = nn.Parameter(split_tensor(module.c_attn.bias, self.world_size, dim=0)[self.rank])
-                        module.c_attn.nf = module.c_attn.nf // self.world_size
-                if hasattr(module, 'q_attn'):
-                    module.q_attn.weight = nn.Parameter(split_tensor(module.q_attn.weight, self.world_size, dim=1)[self.rank])
-                    if module.q_attn.bias is not None:
-                        module.q_attn.bias = nn.Parameter(split_tensor(module.q_attn.bias, self.world_size, dim=0)[self.rank])
-                        module.q_attn.nf = module.q_attn.nf // self.world_size
-                module.num_heads = module.num_heads // self.world_size
-                module.split_size = module.split_size // self.world_size
-
-                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
-                module = SequenceWarpper(module, self.group)
-                setattr(upper_module, name, module)
-            elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP):
-                module.c_fc.weight = nn.Parameter(split_tensor(module.c_fc.weight, self.world_size, dim=1)[self.rank])
-                if module.c_fc.bias is not None:
-                    module.c_fc.bias = nn.Parameter(split_tensor(module.c_fc.bias, self.world_size, dim=0)[self.rank])
-                module.c_fc.nf = module.c_fc.nf // self.world_size
-                    
-                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+            if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
                 module = SequenceWarpper(module, self.group)
                 setattr(upper_module, name, module)
             
@@ -262,9 +204,9 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
+    model = DDP(SequenceParallel(model))
+    
     optimizer = AdamW(model.parameters(), lr=5e-5)
-    model = SequenceParallel(model)
-    print(model)
     
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
@@ -292,6 +234,12 @@ def benchmark_dp(rank, args, world_size):
     # Set up the optimizer
     # Training loop
     num_epochs = 3
+    position_ids = torch.arange(
+        0, max_length * 2, device=device
+    ).unsqueeze(0)
+    cache_position = torch.arange(
+        0, max_length * 2, device=device
+    )
     for epoch in range(num_epochs):
         start_time = time.time()
         model.train()
@@ -299,7 +247,7 @@ def benchmark_dp(rank, args, world_size):
     
         for batch in data_loader:
             inputs = batch.to(device)
-            outputs = model(input_ids=inputs, labels=inputs)
+            outputs = model(input_ids=inputs, labels=inputs, position_ids=position_ids, cache_position=cache_position)
             loss = outputs.loss
             loss.backward()
             optimizer.step()
