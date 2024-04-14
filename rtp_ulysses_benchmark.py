@@ -24,6 +24,8 @@ import torch.distributed as dist
 
 import transformers
 
+from functools import partial
+
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -122,7 +124,56 @@ def _reduce_scatter_along_first_dim(input_):
     )
     return output
     
+def _split_along_last_dim(input_):
+    """Split the tensor along its first dimension and keep the
+    corresponding slice."""
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    input_list = split_tensor(input_, world_size)
+
+    output = input_list[rank].contiguous()
+
+    return output
     
+def _gather_along_last_dim(input_):
+    """Gather tensors and concatinate along the first dimension."""
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+    world_size = torch.distributed.get_world_size(group=group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    dim_size[-1] = dim_size[-1] * world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    torch.distributed._all_gather_base(
+        output, input_.contiguous(), group=group
+    )
+
+    return output
+    
+class _GatherFromModelParallelRegion(torch.autograd.Function):
+    """Gather the input from model parallel region and concatinate."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather_along_last_dim(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _gather_along_last_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _split_along_last_dim(grad_output)
+
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     """Gather the input from sequence parallel region and concatinate."""
 
@@ -178,56 +229,78 @@ class SequenceWarpper(nn.Module):
             
         return outputs
         
-def _split_along_last_dim(input_):
-    """Split the tensor along its first dimension and keep the
-    corresponding slice."""
-    group = torch.distributed.distributed_c10d._get_default_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    rank = torch.distributed.get_rank(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    input_list = split_tensor(input_, world_size)
-
-    output = input_list[rank].contiguous()
-
-    return output
+def _all_to_all(
+    input_: torch.Tensor,
+    world_size: int,
+    group: dist.ProcessGroup,
+    scatter_dim: int,
+    gather_dim: int,
+):
+    input_list = [t.contiguous() for t in torch.tensor_split(input_, world_size, scatter_dim)]
+    output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
+    dist.all_to_all(output_list, input_list, group=group)
+    return torch.cat(output_list, dim=gather_dim).contiguous()
     
-def _gather_along_last_dim(input_):
-    """Gather tensors and concatinate along the first dimension."""
+class _AllToAll(torch.autograd.Function):
+    """All-to-all communication.
 
-    group = torch.distributed.distributed_c10d._get_default_group()
-    world_size = torch.distributed.get_world_size(group=group)
-    # Bypass the function if we are using only 1 GPU.
-    if world_size == 1:
-        return input_
-
-    dim_size = list(input_.size())
-    dim_size[-1] = dim_size[-1] * world_size
-
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-    torch.distributed._all_gather_base(
-        output, input_.contiguous(), group=group
-    )
-
-    return output
-    
-class _GatherFromModelParallelRegion(torch.autograd.Function):
-    """Gather the input from model parallel region and concatinate."""
+    Args:
+        input_: input matrix
+        process_group: communication group
+        scatter_dim: scatter dimension
+        gather_dim: gather dimension
+    """
 
     @staticmethod
-    def symbolic(graph, input_):
-        return _gather_along_last_dim(input_)
-
-    @staticmethod
-    def forward(ctx, input_):
-        return _gather_along_last_dim(input_)
+    def forward(ctx, input_, process_group, scatter_dim, gather_dim):
+        ctx.process_group = process_group
+        ctx.scatter_dim = scatter_dim
+        ctx.gather_dim = gather_dim
+        ctx.world_size = dist.get_world_size(process_group)
+        output = _all_to_all(input_, ctx.world_size, process_group, scatter_dim, gather_dim)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return _split_along_last_dim(grad_output)
+        grad_output = _all_to_all(
+            grad_output,
+            ctx.world_size,
+            ctx.process_group,
+            ctx.gather_dim,
+            ctx.scatter_dim,
+        )
+        return (
+            grad_output,
+            None,
+            None,
+            None,
+        )
+
+def all_to_all(
+    input_: torch.Tensor,
+    process_group: dist.ProcessGroup,
+    scatter_dim: int = 2,
+    gather_dim: int = 1,
+):
+    return _AllToAll.apply(input_, process_group, scatter_dim, gather_dim)
+    
+class EmbedderWarpper(nn.Module):
+    def __init__(
+        self,
+        module: nn.Module,
+        group: Optional[Any] = None,
+    ):
+        super().__init__()
+        self.module = module
+        self.group = group
         
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        outputs = self.module(*args, **kwargs)
+        print('EmbedderWarpper', outputs.shape)
+        outputs = all_to_all(outputs, self.group, scatter_dim=1, gather_dim=-1)
+        print('EmbedderWarpper', outputs.shape)
+        return outputs
+
 class AllgatherWarpper(nn.Module):
     def __init__(
         self,
@@ -255,7 +328,9 @@ class SequenceParallel(nn.Module):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         
+        self.FlyweightModule_list = []
         self.RecursiveVisit('module', self.module, self.module)
+        self.eval= False
         
     def RecursiveVisit(self, name, module, upper_module):
         """
@@ -275,36 +350,40 @@ class SequenceParallel(nn.Module):
             for name, child in module.named_children():
                 self.RecursiveVisit(name, child, module)
         else:
-            if isinstance(module, nn.Embedding) or isinstance(module, nn.Linear):
-                module = DDP(module)
-                setattr(upper_module, name, module)
-            elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
-                if module.c_attn is not None:
-                    module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
-                    if module.c_attn.bias is not None:
-                        module.c_attn.bias = nn.Parameter(split_tensor(module.c_attn.bias, self.world_size, dim=0)[self.rank])
-                        module.c_attn.nf = module.c_attn.nf // self.world_size
-                if hasattr(module, 'q_attn'):
-                    module.q_attn.weight = nn.Parameter(split_tensor(module.q_attn.weight, self.world_size, dim=1)[self.rank])
-                    if module.q_attn.bias is not None:
-                        module.q_attn.bias = nn.Parameter(split_tensor(module.q_attn.bias, self.world_size, dim=0)[self.rank])
-                        module.q_attn.nf = module.q_attn.nf // self.world_size
-                module.num_heads = module.num_heads // self.world_size
-                module.split_size = module.split_size // self.world_size
+            if isinstance(module, nn.Embedding):
+                pass
+                return
+                if module.embedding_dim % self.world_size == 0:
+                    module.weight = nn.Parameter(split_tensor(module.weight, self.world_size, dim=1)[self.rank])
+                    module = AllgatherWarpper(module, self.group)
+                    setattr(upper_module, name, module)
+            # if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+            #     if module.c_attn is not None:
+            #         module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
+            #         if module.c_attn.bias is not None:
+            #             module.c_attn.bias = nn.Parameter(split_tensor(module.c_attn.bias, self.world_size, dim=0)[self.rank])
+            #             module.c_attn.nf = module.c_attn.nf // self.world_size
+            #     if hasattr(module, 'q_attn'):
+            #         module.q_attn.weight = nn.Parameter(split_tensor(module.q_attn.weight, self.world_size, dim=1)[self.rank])
+            #         if module.q_attn.bias is not None:
+            #             module.q_attn.bias = nn.Parameter(split_tensor(module.q_attn.bias, self.world_size, dim=0)[self.rank])
+            #             module.q_attn.nf = module.q_attn.nf // self.world_size
+            #     module.num_heads = module.num_heads // self.world_size
+            #     module.split_size = module.split_size // self.world_size
 
-                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
-                module = SequenceWarpper(module, self.group)
-                setattr(upper_module, name, module)
-            elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP):
-                module.c_fc.weight = nn.Parameter(split_tensor(module.c_fc.weight, self.world_size, dim=1)[self.rank])
-                if module.c_fc.bias is not None:
-                    module.c_fc.bias = nn.Parameter(split_tensor(module.c_fc.bias, self.world_size, dim=0)[self.rank])
-                module.c_fc.nf = module.c_fc.nf // self.world_size
+            #     module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+            #     module = SequenceWarpper(module, self.group)
+            #     setattr(upper_module, name, module)
+            # elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP):
+            #     module.c_fc.weight = nn.Parameter(split_tensor(module.c_fc.weight, self.world_size, dim=1)[self.rank])
+            #     if module.c_fc.bias is not None:
+            #         module.c_fc.bias = nn.Parameter(split_tensor(module.c_fc.bias, self.world_size, dim=0)[self.rank])
+            #     module.c_fc.nf = module.c_fc.nf // self.world_size
                     
-                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
-                module = SequenceWarpper(module, self.group)
-                setattr(upper_module, name, module)
-                
+            #     module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+            #     module = SequenceWarpper(module, self.group)
+            #     setattr(upper_module, name, module)
+            
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
         return outputs
@@ -331,8 +410,7 @@ def benchmark_dp(rank, args, world_size):
     
     model = SequenceParallel(model)
     optimizer = AdamW(model.parameters(), lr=5e-5)
-    print(model)
-    
+
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
         def __init__(self, tokenizer, num_samples, max_length):

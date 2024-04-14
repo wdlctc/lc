@@ -49,6 +49,40 @@ def init_random_seed(seed: int):
     np.random.seed(seed)
 
 
+def ensure_divisibility(numerator: int, denominator: int) -> None:
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+
+def split_tensor(
+    tensor: torch.Tensor, num_partitions: int, contiguous_split_chunks: bool = False, dim: int = -1
+) -> List[torch.Tensor]:
+    """ Split a tensor along its last dimension.
+
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                     in memory.
+
+        Returns:
+            A list of Tensors
+    """
+    # Get the size and dimension.
+    dim_size = divide(tensor.size()[dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, dim_size, dim=dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
 def _gather_along_first_dim(input_):
     """Gather tensors and concatinate along the first dimension."""
 
@@ -259,7 +293,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="openai-community/gpt2"
+        "--model_name", type=str, default="openai-community/gpt2-medium"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"

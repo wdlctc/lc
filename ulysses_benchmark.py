@@ -366,7 +366,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = DDP(SequenceParallel(model))
+    model = FullyShardedDataParallel(SequenceParallel(model))
 
     print(model)
     
@@ -432,7 +432,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="openai-community/gpt2"
+        "--model_name", type=str, default="openai-community/gpt2-medium"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
