@@ -366,7 +366,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = FullyShardedDataParallel(SequenceParallel(model))
+    model = DDP(SequenceParallel(model))
 
     print(model)
     

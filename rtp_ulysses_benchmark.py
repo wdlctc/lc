@@ -25,6 +25,7 @@ import torch.distributed as dist
 import transformers
 
 from functools import partial
+from rtp.rotated_tensor_parallel import FlyweightWarpper, hook_fn
 
 from typing import (
     TYPE_CHECKING,
@@ -351,12 +352,62 @@ class SequenceParallel(nn.Module):
                 self.RecursiveVisit(name, child, module)
         else:
             if isinstance(module, nn.Embedding):
-                pass
-                return
                 if module.embedding_dim % self.world_size == 0:
                     module.weight = nn.Parameter(split_tensor(module.weight, self.world_size, dim=1)[self.rank])
-                    module = AllgatherWarpper(module, self.group)
+                    module = FlyweightWarpper(module, self.group)
                     setattr(upper_module, name, module)
+                    self.FlyweightModule_list.append(module)
+                    
+            elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+                if module.c_attn is not None:
+                    module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
+                    if module.c_attn.bias is not None:
+                        module.c_attn.bias = nn.Parameter(split_tensor(module.c_attn.bias, self.world_size, dim=0)[self.rank])
+                        module.c_attn.nf = module.c_attn.nf // self.world_size
+                if hasattr(module, 'q_attn'):
+                    module.q_attn.weight = nn.Parameter(split_tensor(module.q_attn.weight, self.world_size, dim=1)[self.rank])
+                    if module.q_attn.bias is not None:
+                        module.q_attn.bias = nn.Parameter(split_tensor(module.q_attn.bias, self.world_size, dim=0)[self.rank])
+                        module.q_attn.nf = module.q_attn.nf // self.world_size
+                module.num_heads = module.num_heads // self.world_size
+                module.split_size = module.split_size // self.world_size
+
+                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.c_proj.bias is not None:
+                    module.c_proj.bias.data.div_(self.world_size)
+                module = FlyweightWarpper(module, self.group, cat_output=False)
+
+                setattr(upper_module, name, module)
+
+                self.FlyweightModule_list.append(module)
+            elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP):
+                module.c_fc.weight = nn.Parameter(split_tensor(module.c_fc.weight, self.world_size, dim=1)[self.rank])
+                if module.c_fc.bias is not None:
+                    module.c_fc.bias = nn.Parameter(split_tensor(module.c_fc.bias, self.world_size, dim=0)[self.rank])
+                module.c_fc.nf = module.c_fc.nf // self.world_size
+                    
+                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+                module = FlyweightWarpper(module, self.group, cat_output=False)
+                setattr(upper_module, name, module)
+                self.FlyweightModule_list.append(module)
+                
+            elif isinstance(module, nn.Linear):
+                if module.out_features % self.world_size == 0:
+                    module.weight = nn.Parameter(split_tensor(module.weight, self.world_size, dim=0)[self.rank])
+                    if module.bias is not None:
+                        module.bias = nn.Parameter(split_tensor(module.bias, self.world_size, dim=0)[self.rank])
+                    module = FlyweightWarpper(module, self.group, inplace=self.inplace)
+                elif module.in_features % self.world_size == 0:
+                    module.weight = nn.Parameter(split_tensor(module.weight, self.world_size, dim=-1)[self.rank])
+                    if module.bias is not None:
+                        module.bias.data.div_(self.world_size)
+                    module = FlyweightWarpper(module, self.group, row_partition=True, input_partition_dim=-1)
+                else:
+                    raise ValueError("The input or output features of the linear layer must be divisible by the world size.")
+                
+                setattr(upper_module, name, module)
+
+                self.FlyweightModule_list.append(module)
             # if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
             #     if module.c_attn is not None:
             #         module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
@@ -386,8 +437,30 @@ class SequenceParallel(nn.Module):
             
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
+        if not self.eval:
+            self._register_post_backward_hooks()
         return outputs
 
+    def _register_post_backward_hooks(self) -> None:
+        if not torch.is_grad_enabled():
+            return  # don't register grad hooks if grad isn't enabled
+        for module in self.FlyweightModule_list:
+            for i, sub_module in enumerate(module.module_list):
+                if i == self.rank:
+                    continue
+                sub_module.count = 0
+                for p in sub_module.parameters():
+                    if p.requires_grad:
+                        # Register a hook.
+                        p_tmp = p.expand_as(p)  # Get a grad_fn on p_tmp.
+                        assert p_tmp.grad_fn is not None
+                        grad_acc = p_tmp.grad_fn.next_functions[0][0]  # Gets its GradAccumulation object.
+                        sub_module.count += 1
+
+                        if  not hasattr(p, '_my_handle'):
+                            handle = grad_acc.register_hook(partial(hook_fn, sub_module, module))
+                            p._my_handle = handle
+    
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
@@ -430,6 +503,7 @@ def benchmark_dp(rank, args, world_size):
     num_samples = args.num_samples  # Number of random samples you want to generate
     max_length = args.max_length  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
+    print(model)
     
     # DataLoader
     data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
