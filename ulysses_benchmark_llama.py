@@ -268,10 +268,8 @@ class LinearWarpper(nn.Module):
         if self.pre:
             inputs = all_to_all(inputs, self.group, scatter_dim=1, gather_dim=-1)
         outputs = self.module(inputs)
-        print('LinearWarpper', outputs.shape)
         if not self.pre:
             outputs = all_to_all(outputs, self.group, scatter_dim=-1, gather_dim=1)
-        print('LinearWarpper', outputs.shape)
         return outputs
 
 class AttentionWarpper(nn.Module):
@@ -335,11 +333,6 @@ class SequenceParallel(nn.Module):
             for name, child in module.named_children():
                 self.RecursiveVisit(name, child, module)
         else:
-            if isinstance(module, nn.Embedding):
-                if module.embedding_dim % self.world_size == 0:
-                    module.weight = nn.Parameter(split_tensor(module.weight, self.world_size, dim=1)[self.rank])
-                    module = EmbedderWarpper(module, self.group)
-                    setattr(upper_module, name, module)
             if isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
                 module = AttentionWarpper(module, self.group)
                 setattr(upper_module, name, module)
@@ -368,7 +361,7 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = DDP(SequenceParallel(model))
+    model = FullyShardedDataParallel(SequenceParallel(model))
 
     print(model)
     
@@ -401,10 +394,10 @@ def benchmark_dp(rank, args, world_size):
     # Training loop
     num_epochs = 3
     position_ids = torch.arange(
-        0, max_length, device=device
+        0, max_length * 2, device=device
     ).unsqueeze(0)
     cache_position = torch.arange(
-        0, max_length, device=device
+        0, max_length * 2, device=device
     )
     for epoch in range(num_epochs):
         start_time = time.time()
