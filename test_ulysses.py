@@ -43,6 +43,8 @@ from typing import (
     Union,
 )
 
+import copy
+
 RPC_PORT = 29501
 
 def init_random_seed(seed: int):
@@ -719,7 +721,6 @@ class SequenceParallel(nn.Module):
                             handle = grad_acc.register_hook(partial(hook_fn, sub_module, module))
                             p._my_handle = handle
     
-
 def benchmark_dp(rank, args, world_size):
     """Benchmark a given model using a single process and multiple devices."""
     init_method_pgroup = "tcp://localhost:{}".format(RPC_PORT)
@@ -736,12 +737,42 @@ def benchmark_dp(rank, args, world_size):
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
     
+    
+    def RecursiveVisit(name, module, upper_module):
+        """
+        Recursively replace layers in the module with the custom layer.
+        
+        Args:
+        - module (nn.Module): The module (or model) to modify.
+        - custom_layer_class (nn.Module): The custom layer class to replace with.
+        """
+            
+        has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
+        has_child = any(isinstance(child, nn.Module) for child in module.children())
+        is_MultiheadAttention = isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention)
+
+        if has_child and not is_MultiheadAttention:
+            for name, child in module.named_children():
+                m = RecursiveVisit(name, child, module)
+                if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+                    return m
+        else:
+            return module
+
+    attention = RecursiveVisit('name', model, model)
+
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    
-    model = SequenceParallel(model)
-    optimizer = AdamW(model.parameters(), lr=5e-5)
+    attention.to(device)
+
+    from sp import OriSequenceParallel, TpSequenceParallel, UlyssesParallel, RtpParallel
+
+    orisqattention = OriSequenceParallel(copy.deepcopy(attention))
+    tpsqattention = TpSequenceParallel(copy.deepcopy(attention))
+    ulyssattention = UlyssesParallel(copy.deepcopy(attention))
+    rtpattention = RtpParallel(copy.deepcopy(attention))
+    # model = SequenceParallel(model)
+    # optimizer = AdamW(model.parameters(), lr=5e-5)
 
     # Random data generator dataset class
     class RandomDataGenerator(Dataset):
@@ -761,32 +792,31 @@ def benchmark_dp(rank, args, world_size):
     # Instantiate the dataset
     num_samples = args.num_samples  # Number of random samples you want to generate
     max_length = args.max_length  # Maximum length of the sequence
-    dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
-    print(model)
-    
-    # DataLoader
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
+
     # Set up the optimizer
     # Training loop
-    num_epochs = 3
+    num_epochs = 5
     for epoch in range(num_epochs):
+        init_random_seed(epoch)
         start_time = time.time()
-        model.train()
-        total_loss = 0
+        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
+        inputs = batch.to(device)
+        inputs.div_(100)
+        outputs = attention(hidden_states=inputs)
+
+        output_list = split_tensor(outputs[0], world_size, dim=1)
+        
+        inputs = split_tensor(inputs, world_size, dim=1)[rank]
+        # orioutputs = orisqattention(inputs)[0]
+        # tpoutputs = tpsqattention(inputs)[0]
+        # ulyoutputs = ulyssattention(inputs)[0]
+        rtpoutputs = rtpattention(inputs)[0]
+
+        print((outputs , rtpoutputs))
+        assert torch.allclose(output_list[rank], rtpoutputs, atol=1e-3), f"{torch.max((output_list[rank] - rtpoutputs))}"
     
-        for batch in data_loader:
-            inputs = batch.to(device)
-            outputs = model(input_ids=inputs, labels=inputs)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            total_loss += loss.item()
-    
-        avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time
-        print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
+        print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
 
 
     print(
@@ -810,7 +840,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=4
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
