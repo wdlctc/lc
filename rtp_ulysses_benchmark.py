@@ -207,29 +207,6 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         return _gather_along_first_dim(grad_output)
 
-class SequenceWarpper(nn.Module):
-    def __init__(
-        self,
-        module: nn.Module,
-        group: Optional[Any] = None,
-    ):
-        super().__init__()
-        self.module = module
-        self.group = group
-        
-    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-
-        inputs = _GatherFromSequenceParallelRegion.apply(args[0])
-        outputs = self.module(inputs, **kwargs)
-        if isinstance(outputs, tuple):
-            outputs = list(outputs)
-            outputs[0] = _ReduceScatterToSequenceParallelRegion.apply(outputs[0])
-            outputs = tuple(outputs)
-        else:
-            outputs = _ReduceScatterToSequenceParallelRegion.apply(outputs)
-            
-        return outputs
-        
 def _all_to_all(
     input_: torch.Tensor,
     world_size: int,
@@ -317,9 +294,51 @@ class AllgatherWarpper(nn.Module):
         outputs = _GatherFromModelParallelRegion.apply(outputs)
         return outputs
 
+def _left_rotation(input_):
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+
+    # Bypass the function if we are using only 1 GPU.
+    if torch.distributed.get_world_size(group=group) == 1:
+        return input_
+
+    # Size and dimension.
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+
+    if not hasattr(input_, 'buffer') and not hasattr(input_, 'reqs'):
+        input_.buffer = torch.zeros_like(input_)
+    else:
+        for req in input_.reqs:
+            req.wait()
+        input_.data.copy_(input_._buffer)
+        
+    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank + 1)%world_size)
+    recv_op = torch.distributed.P2POp(torch.distributed.irecv, input_.buffer, (rank - 1 + world_size)%world_size)
+
+    reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
+    input_.reqs = reqs
+
+    return input_
+    
+class _RotationParallelRegion(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _left_rotation(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _left_rotation(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
 
 class GPT2Attention(nn.Module):
-    def __init__(self, ref):
+    def __init__(self, ref, group):
         super().__init__()
         self.config = ref.config
         max_positions = ref.config.max_position_embeddings
@@ -349,6 +368,10 @@ class GPT2Attention(nn.Module):
         self.resid_dropout = ref.resid_dropout
 
         self.pruned_heads = ref.pruned_heads
+
+        self.group = group
+        self.world_size = dist.get_world_size(self.group)
+        self.rank = dist.get_rank(self.group)
     
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -473,6 +496,18 @@ class GPT2Attention(nn.Module):
         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
         return tensor.view(new_shape)
 
+    def rotation_generate(self, hidden_states):
+        output_list = [None for _ in range(self.world_size)]
+        for i in range(self.world_size):
+            hidden_states = _RotationParallelRegion.apply(hidden_states)
+            output_list[i] = self.c_attn(hidden_states)
+        hidden_states.buffer = None
+        hidden_states.reqs = None
+        
+        query, key, value = torch.cat(output_list, dim=1).contiguous().split(self.split_size, dim=2)
+
+        return query, key, value
+        
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
@@ -495,7 +530,7 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
-            query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            query, key, value = self.rotation_generate(hidden_states)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
@@ -518,6 +553,7 @@ class GPT2Attention(nn.Module):
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
+        attn_output = _ReduceScatterToSequenceParallelRegion.apply(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
         outputs = (attn_output, present)
@@ -568,7 +604,18 @@ class SequenceParallel(nn.Module):
                     self.FlyweightModule_list.append(module)
                     
             elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
-                module = GPT2Attention(module)
+                if module.c_attn is not None:
+                    module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
+                    if module.c_attn.bias is not None:
+                        module.c_attn.bias = nn.Parameter(split_tensor(module.c_attn.bias, self.world_size, dim=0)[self.rank])
+                        module.c_attn.nf = module.c_attn.nf // self.world_size
+                module.num_heads = module.num_heads // self.world_size
+                module.split_size = module.split_size // self.world_size
+                    
+                module.c_proj.weight = nn.Parameter(split_tensor(module.c_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.c_proj.bias is not None:
+                    module.c_proj.bias.data.div_(self.world_size)
+                module = GPT2Attention(module, group = self.group)
                 setattr(upper_module, name, module)
                 # if module.c_attn is not None:
                 #     module.c_attn.weight = nn.Parameter(split_tensor(module.c_attn.weight, self.world_size, dim=1)[self.rank])
