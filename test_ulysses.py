@@ -315,8 +315,8 @@ def _left_rotation(input_):
             req.wait()
         input_.data.copy_(input_._buffer)
         
-    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank + 1)%world_size)
-    recv_op = torch.distributed.P2POp(torch.distributed.irecv, input_.buffer, (rank - 1 + world_size)%world_size)
+    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank - 1 + world_size)%world_size)
+    recv_op = torch.distributed.P2POp(torch.distributed.irecv, input_.buffer, (rank + 1)%world_size)
 
     reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
     input_.reqs = reqs
