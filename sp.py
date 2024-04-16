@@ -527,6 +527,27 @@ def _left_rotation(input_, buffer):
     reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
 
     return reqs
+
+
+def _right_rotation(input_, buffer):
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+
+    # Bypass the function if we are using only 1 GPU.
+    if torch.distributed.get_world_size(group=group) == 1:
+        return input_
+
+    # Size and dimension.
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+        
+    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank - 1 + world_size)%world_size)
+    recv_op = torch.distributed.P2POp(torch.distributed.irecv, buffer, (rank + 1)%world_size)
+
+    reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
+
+    return reqs
+    
     
 class _RotationParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
@@ -537,6 +558,9 @@ class _RotationParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_, module, itr):
+        ctx.module = module
+        ctx.itr = itr
+        ctx.save_for_backward(input_)
         if itr == 0:
             module._buffer = torch.zeros_like(input_)
             module.reqs = _left_rotation(input_, module._buffer)
@@ -553,7 +577,34 @@ class _RotationParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None
+        module = ctx.module
+        itr = ctx.itr
+        input_ = ctx.saved_tensors[0]
+        if itr == torch.distributed.get_world_size() - 1:
+            module._buffer = torch.zeros_like(input_)
+            module.reqs = _right_rotation(input_, module._buffer)
+            for req in module.reqs:
+                req.wait()
+            input_.data.copy_(module._buffer)
+            module.reqs = _right_rotation(grad_output, module._buffer)
+            for req in module.reqs:
+                req.wait()
+            grad_output = module._buffer
+            return grad_output, None, None
+        else:
+            if itr != 0:
+                module.reqs = _right_rotation(input_, module._buffer)
+                for req in module.reqs:
+                    req.wait()
+                input_.data.copy_(module._buffer)
+                module.reqs = _right_rotation(grad_output, module._buffer)
+                for req in module.reqs:
+                    req.wait()
+                grad_output = module._buffer
+            else:
+                module._buffer = None
+            return grad_output, None, None
+        return grad_output, None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
