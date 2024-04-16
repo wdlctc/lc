@@ -192,7 +192,7 @@ class OriSequenceParallel(nn.Module):
             for name, child in module.named_children():
                 self.RecursiveVisit(name, child, module)
         else:
-            if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+            if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
                 module = OriSequenceWarpper(module, self.group)
                 setattr(upper_module, name, module)
             
@@ -339,6 +339,27 @@ class TpSequenceParallel(nn.Module):
                 module = SequenceWarpper(module, self.group)
                 setattr(upper_module, name, module)
 
+            elif isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+                module.q_proj.weight = nn.Parameter(split_tensor(module.q_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.q_proj.bias is not None:
+                    module.q_proj.bias = nn.Parameter(split_tensor(module.q_proj.bias, self.world_size, dim=0)[self.rank])
+                
+                module.k_proj.weight = nn.Parameter(split_tensor(module.k_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.k_proj.bias is not None:
+                    module.k_proj.bias = nn.Parameter(split_tensor(module.k_proj.bias, self.world_size, dim=0)[self.rank])
+                    
+                module.v_proj.weight = nn.Parameter(split_tensor(module.v_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.v_proj.bias is not None:
+                    module.v_proj.bias = nn.Parameter(split_tensor(module.v_proj.bias, self.world_size, dim=0)[self.rank])
+                    
+                module.o_proj.weight = nn.Parameter(split_tensor(module.o_proj.weight, self.world_size, dim=1)[self.rank])
+                
+                module.num_heads = module.num_heads // self.world_size
+                module.num_key_value_heads = module.num_key_value_heads // self.world_size
+                module.hidden_size = module.hidden_size // self.world_size
+                module = SequenceWarpper(module, self.group)
+                setattr(upper_module, name, module)
+                
             elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP):
                 module.c_fc.weight = nn.Parameter(split_tensor(module.c_fc.weight, self.world_size, dim=1)[self.rank])
                 if module.c_fc.bias is not None:
@@ -414,6 +435,7 @@ class LinearWarpper(nn.Module):
         module: nn.Module,
         group: Optional[Any] = None,
         pre = False,
+        qkv = False
     ):
         super().__init__()
         self.module = module
@@ -421,6 +443,7 @@ class LinearWarpper(nn.Module):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.pre = pre
+        self.qkv = qkv
         
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
 
@@ -430,8 +453,9 @@ class LinearWarpper(nn.Module):
             inputs = all_to_all(inputs, self.group, scatter_dim=1, gather_dim=-1)
         outputs = self.module(inputs)
         if not self.pre:
-            outputs_list = [t.contiguous() for t in torch.tensor_split(outputs, self.world_size * 3, -1)]
-            outputs = torch.cat([torch.cat([outputs_list[i + j * self.world_size] for j in range(3)], dim = -1) for i in range(self.world_size)], dim = -1)
+            if self.qkv:
+                outputs_list = [t.contiguous() for t in torch.tensor_split(outputs, self.world_size * 3, -1)]
+                outputs = torch.cat([torch.cat([outputs_list[i + j * self.world_size] for j in range(3)], dim = -1) for i in range(self.world_size)], dim = -1)
             outputs = all_to_all(outputs, self.group, scatter_dim=-1, gather_dim=1)
         return outputs
 
@@ -447,12 +471,22 @@ class AttentionWarpper(nn.Module):
         self.group = group
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
-        
-        self.module.num_heads = module.num_heads // self.world_size
-        self.module.split_size = module.split_size // self.world_size
 
-        self.replace_linear('c_attn', self.module.c_attn)
-        self.replace_linear('c_proj', self.module.c_proj, pre=True)
+        if isinstance(self.module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+            self.module.num_heads = module.num_heads // self.world_size
+            self.module.split_size = module.split_size // self.world_size
+    
+            self.replace_linear('c_attn', self.module.c_attn, qkv=True)
+            self.replace_linear('c_proj', self.module.c_proj, pre=True)
+        elif isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+            self.module.num_heads = module.num_heads // self.world_size
+            self.module.num_key_value_heads = module.num_key_value_heads // self.world_size
+            self.module.hidden_size = module.hidden_size // self.world_size
+    
+            self.replace_linear('q_proj', self.module.q_proj)
+            self.replace_linear('k_proj', self.module.k_proj)
+            self.replace_linear('v_proj', self.module.v_proj)
+            self.replace_linear('o_proj', self.module.o_proj, pre=True)
 
     def replace_linear(self, name, module, pre=False):
         module = LinearWarpper(module, self.group, pre)
@@ -847,6 +881,138 @@ class GPT2Attention(nn.Module):
 
         return outputs  # a, present, (attentions)
 
+class LlamaSdpaAttention(nn.Module):
+    """
+    Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    SDPA API.
+    """
+    def __init__(self, ref, group):
+        super().__init__()
+        self.config = ref.config
+        self.layer_idx = ref.layer_idx
+        self.attention_dropout = ref.attention_dropout
+        self.hidden_size = ref.hidden_size
+        self.num_heads = ref.num_heads
+        self.head_dim = ref.head_dim
+        self.num_key_value_heads = ref.num_key_value_heads
+        self.num_key_value_groups = ref.num_key_value_groups
+        self.max_position_embeddings = ref.max_position_embeddings
+        self.rope_theta = ref.rope_theta
+        self.is_causal = ref.is_causal
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        self.q_proj = ref.q_proj
+        self.k_proj = ref.k_proj
+        self.v_proj = ref.v_proj
+        self.o_proj = ref.o_proj
+        self.rotary_emb = ref.rotary_emb
+
+    def rotation_generate(self, hidden_states):
+        query_list = [None for _ in range(self.world_size)]
+        key_list = [None for _ in range(self.world_size)]
+        value_list = [None for _ in range(self.world_size)]
+        for i in range(self.world_size):
+            hidden_states = _RotationParallelRegion.apply(hidden_states, self, i)
+            query_list[i] = self.q_proj(hidden_states)
+            key_list[i] = self.k_proj(hidden_states)
+            value_list[i] = self.v_proj(hidden_states)
+
+        
+        query = torch.cat(query_list, dim=1).contiguous()
+        key = torch.cat(key_list, dim=1).contiguous()
+        value = torch.cat(value_list, dim=1).contiguous()
+        
+        return query, key, value
+        
+    # Adapted from LlamaAttention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states, key_states, value_states = self.rotation_generate(hidden_states)
+        # query_states = self.q_proj(hidden_states)
+        # key_states = self.k_proj(hidden_states)
+        # value_states = self.v_proj(hidden_states)
+        
+        bsz, q_len, _ = query_states.size()
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # In case static cache is used, it is an instance attribute.
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        # if attention_mask is not None and cache_position is not None:
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+        
+        attn_output = _ReduceScatterToSequenceParallelRegion.apply(attn_output)
+
+        return attn_output, None, past_key_value
+
 class RtpParallel(nn.Module):
     def __init__(
         self,
@@ -911,6 +1077,28 @@ class RtpParallel(nn.Module):
                 setattr(upper_module, name, module)
 
     
+            elif isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+                module.q_proj.weight = nn.Parameter(split_tensor(module.q_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.q_proj.bias is not None:
+                    module.q_proj.bias = nn.Parameter(split_tensor(module.q_proj.bias, self.world_size, dim=0)[self.rank])
+                
+                module.k_proj.weight = nn.Parameter(split_tensor(module.k_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.k_proj.bias is not None:
+                    module.k_proj.bias = nn.Parameter(split_tensor(module.k_proj.bias, self.world_size, dim=0)[self.rank])
+                    
+                module.v_proj.weight = nn.Parameter(split_tensor(module.v_proj.weight, self.world_size, dim=0)[self.rank])
+                if module.v_proj.bias is not None:
+                    module.v_proj.bias = nn.Parameter(split_tensor(module.v_proj.bias, self.world_size, dim=0)[self.rank])
+                    
+                module.o_proj.weight = nn.Parameter(split_tensor(module.o_proj.weight, self.world_size, dim=1)[self.rank])
+                
+                module.num_heads = module.num_heads // self.world_size
+                module.num_key_value_heads = module.num_key_value_heads // self.world_size
+                module.hidden_size = module.hidden_size // self.world_size
+                
+                module = LlamaSdpaAttention(module, group = self.group)
+                setattr(upper_module, name, module)
+                
                 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
