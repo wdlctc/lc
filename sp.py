@@ -153,8 +153,13 @@ class OriSequenceWarpper(nn.Module):
         
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
 
-        inputs = _GatherFromSequenceParallelRegion.apply(args[0])
-        outputs = self.module(inputs, **kwargs)
+        if args:
+            inputs = _GatherFromSequenceParallelRegion.apply(args[0])
+            outputs = self.module(inputs, **kwargs)
+        else:
+            kwargs['hidden_states'] = _GatherFromSequenceParallelRegion.apply(kwargs['hidden_states'])
+            outputs = self.module(*args, **kwargs)
+            
         outputs = list(outputs)
         outputs[0] = _ScatterToSequenceParallelRegion.apply(outputs[0])
         outputs = tuple(outputs)
@@ -265,8 +270,13 @@ class SequenceWarpper(nn.Module):
         
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
 
-        inputs = _Gather.apply(args[0])
-        outputs = self.module(inputs, **kwargs)
+        if args:
+            inputs = _Gather.apply(args[0])
+            outputs = self.module(inputs, **kwargs)
+        else:
+            kwargs['hidden_states'] = _Gather.apply(kwargs['hidden_states'])
+            outputs = self.module(*args, **kwargs)
+            
         if isinstance(outputs, tuple):
             outputs = list(outputs)
             outputs[0] = _ReduceScatter.apply(outputs[0])
@@ -488,8 +498,8 @@ class AttentionWarpper(nn.Module):
             self.replace_linear('v_proj', self.module.v_proj)
             self.replace_linear('o_proj', self.module.o_proj, pre=True)
 
-    def replace_linear(self, name, module, pre=False):
-        module = LinearWarpper(module, self.group, pre)
+    def replace_linear(self, name, module, pre=False, qkv=True):
+        module = LinearWarpper(module, self.group, pre, qkv)
         setattr(self.module, name, module)
         
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -508,7 +518,7 @@ class UlyssesParallel(nn.Module):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         
-        self.RecursiveVisit('module', self.module, self.module)
+        self.RecursiveVisit('module', self.module, self)
         
     def RecursiveVisit(self, name, module, upper_module):
         """
