@@ -380,6 +380,16 @@ class TpSequenceParallel(nn.Module):
                 module = SequenceWarpper(module, self.group)
                 setattr(upper_module, name, module)
                 
+            elif isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP):
+                module.up_proj.weight = nn.Parameter(split_tensor(module.up_proj.weight, self.world_size, dim=0)[self.rank])
+                    
+                module.gate_proj.weight = nn.Parameter(split_tensor(module.gate_proj.weight, self.world_size, dim=0)[self.rank])
+                
+                module.down_proj.weight = nn.Parameter(split_tensor(module.down_proj.weight, self.world_size, dim=1)[self.rank])
+
+                module = SequenceWarpper(module, self.group)
+                setattr(upper_module, name, module)
+                
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
         return outputs
@@ -1071,6 +1081,48 @@ class LlamaSdpaAttention(nn.Module):
 
         return attn_output, None, past_key_value
 
+class RtpWarpper(nn.Module):
+    def __init__(
+        self,
+        module: nn.Module,
+        group: Optional[Any] = None,
+    ):
+        super().__init__()
+        self.module = module
+        self.group = group
+        self.world_size = dist.get_world_size(self.group)
+        self.rank = dist.get_rank(self.group)
+        
+    def rotation_generate(self, *args: Any, **kwargs: Any):
+        output_list = [None for _ in range(self.world_size)]
+
+
+        for i in range(self.world_size):
+            if args:
+                inputs = _RotationParallelRegion.apply(args[0], self, i)
+                outputs = self.module(inputs, **kwargs)
+            else:
+                kwargs['hidden_states'] = _RotationParallelRegion.apply(kwargs['hidden_states'], self, i)
+                outputs = self.module(*args, **kwargs)
+            output_list[(i + self.rank) % self.world_size] = outputs
+
+        outputs = torch.cat(output_list, dim=1).contiguous()
+
+        return outputs
+        
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+
+        outputs = self.rotation_generate(*args, **kwargs)
+            
+        if isinstance(outputs, tuple):
+            outputs = list(outputs)
+            outputs[0] = _ReduceScatterToSequenceParallelRegion.apply(outputs[0])
+            outputs = tuple(outputs)
+        else:
+            outputs = _ReduceScatterToSequenceParallelRegion.apply(outputs)
+            
+        return outputs
+
 class RtpParallel(nn.Module):
     def __init__(
         self,
@@ -1157,6 +1209,15 @@ class RtpParallel(nn.Module):
                 module = LlamaSdpaAttention(module, group = self.group)
                 setattr(upper_module, name, module)
                 
+            elif isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP):
+                module.up_proj.weight = nn.Parameter(split_tensor(module.up_proj.weight, self.world_size, dim=0)[self.rank])
+                    
+                module.gate_proj.weight = nn.Parameter(split_tensor(module.gate_proj.weight, self.world_size, dim=0)[self.rank])
+                
+                module.down_proj.weight = nn.Parameter(split_tensor(module.down_proj.weight, self.world_size, dim=1)[self.rank])
+
+                module = RtpWarpper(module, self.group)
+                setattr(upper_module, name, module)
                 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)
