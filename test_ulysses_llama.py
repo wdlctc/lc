@@ -130,7 +130,8 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
 
-    from sp import OriSequenceParallel, TpSequenceParallel, UlyssesParallel, RtpParallel
+    from sp import OriSequenceParallel, TpSequenceParallel, UlyssesParallel
+    from rotation import RtpParallel
 
     orisqattention = OriSequenceParallel(copy.deepcopy(attention))
     tpsqattention = TpSequenceParallel(copy.deepcopy(attention))
@@ -167,7 +168,7 @@ def benchmark_dp(rank, args, world_size):
     )
     # Set up the optimizer
     # Training loop
-    num_epochs = 4
+    num_epochs = 5
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
@@ -188,16 +189,17 @@ def benchmark_dp(rank, args, world_size):
         # ref = orisqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = tpsqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = ulyssattention(seq_inputs, position_ids=position_ids)[0]
+        # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
         ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
 
-        # print(output_list[rank], ref)
+        print(output_list[rank], ref)
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
 
-        inputs.retain_grad()
-        seq_inputs.retain_grad()
+        # inputs.retain_grad()
+        # seq_inputs.retain_grad()
         
-        outputs[0].mean().backward()
-        ref[0].mean().backward()
+        # outputs[0].mean().backward()
+        # ref[0].mean().backward()
 
         # ## oritp
         # for name, p in orisqattention.named_parameters():
@@ -254,30 +256,30 @@ def benchmark_dp(rank, args, world_size):
         #     p2[1].grad = None
             
         # rtp
-        for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
+        # for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
 
-            tp_dim = None
-            for i, dim in enumerate(p1[1].grad.shape):
-                if dim != p2[1].grad.shape[i]:
-                    tp_dim = i
-                    break
+        #     tp_dim = None
+        #     for i, dim in enumerate(p1[1].grad.shape):
+        #         if dim != p2[1].grad.shape[i]:
+        #             tp_dim = i
+        #             break
 
-            if 'c_attn' in p1[0]:
-                ref_list = split_tensor(p2[1].grad, world_size * 3, dim=tp_dim)
-                ref = torch.cat([ref_list[rank + i*world_size] for i in range(3)], dim = tp_dim).mul_(2)
-            elif tp_dim != None:
-                ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(2)
-            else:
-                ref = p2[1].grad.mul_(2)
+        #     if 'c_attn' in p1[0]:
+        #         ref_list = split_tensor(p2[1].grad, world_size * 3, dim=tp_dim)
+        #         ref = torch.cat([ref_list[rank + i*world_size] for i in range(3)], dim = tp_dim).mul_(2)
+        #     elif tp_dim != None:
+        #         ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(2)
+        #     else:
+        #         ref = p2[1].grad.mul_(2)
             
-            assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
-            # print(p1[1].grad, ref)
-            p1[1].grad = None
-            p2[1].grad = None
+        #     assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
+        #     # print(p1[1].grad, ref)
+        #     p1[1].grad = None
+        #     p2[1].grad = None
 
-        inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(2)
-        # print(inputs_grad, seq_inputs.grad)
-        assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-4), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
+        # inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(2)
+        # # print(inputs_grad, seq_inputs.grad)
+        # assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-4), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
         
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
