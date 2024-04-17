@@ -209,46 +209,47 @@ class _RotationParallelRegion_all(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, module, itr, name):
+    def symbolic(graph, input_, module, itr):
         return _left_rotation(input_)
 
     @staticmethod
-    def forward(ctx, input_, module, itr, name):
+    def forward(ctx, module, query, key, value, query_list, key_list, value_list, itr, index):
         ctx.module = module
         ctx.itr = itr
-        ctx.name = name
+        print('_RotationParallelRegion_all(torch.autograd.Function):')
         print(itr)
-        buffer_list = getattr(module, name)
-        if itr != 0:
-            buffer_list[itr] = torch.zeros_like(input_)
-            module.all_reqs = _right_rotation(input_.data, buffer_list[itr], itr)
-            return input_
+        if itr == 0:
+            query_list[index] = query
+            key_list[index] = key
+            value_list[index] = value
         else:
-            return input_
+            query_list[index] = torch.zeros_like(query)
+            key_list[index] = torch.zeros_like(key)
+            value_list[index] = torch.zeros_like(value)
+            module.all_reqs = _right_rotation(query, query_list[index], itr) + _right_rotation(key, key_list[index], itr) + _right_rotation(value, value_list[index], itr)
+        return query_list[index], key_list[index], value_list[index]
 
     @staticmethod
-    def backward(ctx, grad_output):
-        print('class _RotationParallelRegion_all(torch.autograd.Function):')
+    def backward(ctx, query, key, value):
         module = ctx.module
         itr = ctx.itr
-        name = ctx.name
 
-        if itr != 0:
+        if itr != torch.distributed.get_world_size() - 1:
             for req in module.reqs:
                 req.wait()
             module.flat_param.data.copy_(module._buffer)
         
-        if itr != torch.distributed.get_world_size() - 1:
-            buffer = torch.zeros_like(grad_output)
-            reqs = _left_rotation(grad_output, buffer, itr)
-            for req in reqs:
-                req.wait()
-            grad_output.data.copy_(buffer)
-            buffer = None
+        if itr != 0:
+            # buffer = torch.zeros_like(grad_output)
+            # reqs = _left_rotation(grad_output, buffer, itr)
+            # for req in reqs:
+            #     req.wait()
+            # grad_output.data.copy_(buffer)
+            # buffer = None
             
-            return grad_output, None, None, None
+            return None, query, key, value, None, None, None, None, None
         else:
-            return grad_output, None, None, None`
+            return None, query, key, value, None, None, None, None, None
     
 class _RotationParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
@@ -311,230 +312,230 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         return _gather_along_first_dim(grad_output)
 
-class GPT2Attention(nn.Module):
-    def __init__(self, ref, group):
-        super().__init__()
-        self.config = ref.config
-        max_positions = ref.config.max_position_embeddings
-        self.bias = ref.bias
-        self.masked_bias = ref.masked_bias
+# class GPT2Attention(nn.Module):
+#     def __init__(self, ref, group):
+#         super().__init__()
+#         self.config = ref.config
+#         max_positions = ref.config.max_position_embeddings
+#         self.bias = ref.bias
+#         self.masked_bias = ref.masked_bias
 
-        self.embed_dim = ref.embed_dim
-        self.num_heads = ref.num_heads
-        self.head_dim = ref.head_dim
-        self.split_size = ref.split_size
-        self.scale_attn_weights = ref.scale_attn_weights
-        self.is_cross_attention = ref.is_cross_attention
+#         self.embed_dim = ref.embed_dim
+#         self.num_heads = ref.num_heads
+#         self.head_dim = ref.head_dim
+#         self.split_size = ref.split_size
+#         self.scale_attn_weights = ref.scale_attn_weights
+#         self.is_cross_attention = ref.is_cross_attention
 
-        # Layer-wise attention scaling, reordering, and upcasting
-        self.scale_attn_by_inverse_layer_idx = ref.scale_attn_by_inverse_layer_idx
-        self.layer_idx = ref.layer_idx
-        self.reorder_and_upcast_attn = ref.reorder_and_upcast_attn
+#         # Layer-wise attention scaling, reordering, and upcasting
+#         self.scale_attn_by_inverse_layer_idx = ref.scale_attn_by_inverse_layer_idx
+#         self.layer_idx = ref.layer_idx
+#         self.reorder_and_upcast_attn = ref.reorder_and_upcast_attn
 
-        if self.is_cross_attention:
-            self.c_attn = ref.c_attn
-            self.q_attn = ref.q_attn
-        else:
-            self.c_attn = ref.c_attn
-        self.c_proj = ref.c_proj 
+#         if self.is_cross_attention:
+#             self.c_attn = ref.c_attn
+#             self.q_attn = ref.q_attn
+#         else:
+#             self.c_attn = ref.c_attn
+#         self.c_proj = ref.c_proj 
 
-        self.attn_dropout = ref.attn_dropout
-        self.resid_dropout = ref.resid_dropout
+#         self.attn_dropout = ref.attn_dropout
+#         self.resid_dropout = ref.resid_dropout
 
-        self.pruned_heads = ref.pruned_heads
+#         self.pruned_heads = ref.pruned_heads
 
-        self.group = group
-        self.world_size = dist.get_world_size(self.group)
-        self.rank = dist.get_rank(self.group)
+#         self.group = group
+#         self.world_size = dist.get_world_size(self.group)
+#         self.rank = dist.get_rank(self.group)
     
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(heads, self.num_heads, self.head_dim, self.pruned_heads)
-        index_attn = torch.cat([index, index + self.split_size, index + (2 * self.split_size)])
+#     def prune_heads(self, heads):
+#         if len(heads) == 0:
+#             return
+#         heads, index = find_pruneable_heads_and_indices(heads, self.num_heads, self.head_dim, self.pruned_heads)
+#         index_attn = torch.cat([index, index + self.split_size, index + (2 * self.split_size)])
 
-        # Prune conv1d layers
-        self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
-        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
+#         # Prune conv1d layers
+#         self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
+#         self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
 
-        # Update hyper params
-        self.split_size = (self.split_size // self.num_heads) * (self.num_heads - len(heads))
-        self.num_heads = self.num_heads - len(heads)
-        self.pruned_heads = self.pruned_heads.union(heads)
+#         # Update hyper params
+#         self.split_size = (self.split_size // self.num_heads) * (self.num_heads - len(heads))
+#         self.num_heads = self.num_heads - len(heads)
+#         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+#     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+#         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
-        if self.scale_attn_weights:
-            attn_weights = attn_weights / torch.full(
-                [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
-            )
+#         if self.scale_attn_weights:
+#             attn_weights = attn_weights / torch.full(
+#                 [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
+#             )
 
-        # Layer-wise attention scaling
-        if self.scale_attn_by_inverse_layer_idx:
-            attn_weights = attn_weights / float(self.layer_idx + 1)
+#         # Layer-wise attention scaling
+#         if self.scale_attn_by_inverse_layer_idx:
+#             attn_weights = attn_weights / float(self.layer_idx + 1)
 
-        if not self.is_cross_attention:
-            # if only "normal" attention layer implements causal mask
-            query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-            mask_value = torch.finfo(attn_weights.dtype).min
-            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
-            attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+#         if not self.is_cross_attention:
+#             # if only "normal" attention layer implements causal mask
+#             query_length, key_length = query.size(-2), key.size(-2)
+#             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+#             mask_value = torch.finfo(attn_weights.dtype).min
+#             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+#             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+#             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+#             attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
+#         if attention_mask is not None:
+#             # Apply the attention mask
+#             attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+#         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
-        attn_weights = attn_weights.type(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
+#         # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+#         attn_weights = attn_weights.type(value.dtype)
+#         attn_weights = self.attn_dropout(attn_weights)
 
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
+#         # Mask heads if we want to
+#         if head_mask is not None:
+#             attn_weights = attn_weights * head_mask
 
-        attn_output = torch.matmul(attn_weights, value)
+#         attn_output = torch.matmul(attn_weights, value)
 
-        return attn_output, attn_weights
+#         return attn_output, attn_weights
 
-    def _upcast_and_reordered_attn(self, query, key, value, attention_mask=None, head_mask=None):
-        # Use `torch.baddbmm` (a bit more efficient w/ alpha param for scaling -- from Megatron-LM)
-        bsz, num_heads, q_seq_len, dk = query.size()
-        _, _, k_seq_len, _ = key.size()
+#     def _upcast_and_reordered_attn(self, query, key, value, attention_mask=None, head_mask=None):
+#         # Use `torch.baddbmm` (a bit more efficient w/ alpha param for scaling -- from Megatron-LM)
+#         bsz, num_heads, q_seq_len, dk = query.size()
+#         _, _, k_seq_len, _ = key.size()
 
-        # Preallocate attn_weights for `baddbmm`
-        attn_weights = torch.empty(bsz * num_heads, q_seq_len, k_seq_len, dtype=torch.float32, device=query.device)
+#         # Preallocate attn_weights for `baddbmm`
+#         attn_weights = torch.empty(bsz * num_heads, q_seq_len, k_seq_len, dtype=torch.float32, device=query.device)
 
-        # Compute Scale Factor
-        scale_factor = 1.0
-        if self.scale_attn_weights:
-            scale_factor /= float(value.size(-1)) ** 0.5
+#         # Compute Scale Factor
+#         scale_factor = 1.0
+#         if self.scale_attn_weights:
+#             scale_factor /= float(value.size(-1)) ** 0.5
 
-        if self.scale_attn_by_inverse_layer_idx:
-            scale_factor /= float(self.layer_idx + 1)
+#         if self.scale_attn_by_inverse_layer_idx:
+#             scale_factor /= float(self.layer_idx + 1)
 
-        # Upcast (turn off autocast) and reorder (Scale K by 1 / root(dk))
-        with autocast(enabled=False):
-            q, k = query.reshape(-1, q_seq_len, dk), key.transpose(-1, -2).reshape(-1, dk, k_seq_len)
-            attn_weights = torch.baddbmm(attn_weights, q.float(), k.float(), beta=0, alpha=scale_factor)
-            attn_weights = attn_weights.reshape(bsz, num_heads, q_seq_len, k_seq_len)
+#         # Upcast (turn off autocast) and reorder (Scale K by 1 / root(dk))
+#         with autocast(enabled=False):
+#             q, k = query.reshape(-1, q_seq_len, dk), key.transpose(-1, -2).reshape(-1, dk, k_seq_len)
+#             attn_weights = torch.baddbmm(attn_weights, q.float(), k.float(), beta=0, alpha=scale_factor)
+#             attn_weights = attn_weights.reshape(bsz, num_heads, q_seq_len, k_seq_len)
 
-        if not self.is_cross_attention:
-            # if only "normal" attention layer implements causal mask
-            query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-            mask_value = torch.finfo(attn_weights.dtype).min
-            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-            attn_weights = torch.where(causal_mask, attn_weights, mask_value)
+#         if not self.is_cross_attention:
+#             # if only "normal" attention layer implements causal mask
+#             query_length, key_length = query.size(-2), key.size(-2)
+#             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+#             mask_value = torch.finfo(attn_weights.dtype).min
+#             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+#             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+#             mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+#             attn_weights = torch.where(causal_mask, attn_weights, mask_value)
 
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
+#         if attention_mask is not None:
+#             # Apply the attention mask
+#             attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+#         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
-        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op if otherwise
-        if attn_weights.dtype != torch.float32:
-            raise RuntimeError("Error with upcasting, attn_weights does not have dtype torch.float32")
-        attn_weights = attn_weights.type(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
+#         # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op if otherwise
+#         if attn_weights.dtype != torch.float32:
+#             raise RuntimeError("Error with upcasting, attn_weights does not have dtype torch.float32")
+#         attn_weights = attn_weights.type(value.dtype)
+#         attn_weights = self.attn_dropout(attn_weights)
 
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
+#         # Mask heads if we want to
+#         if head_mask is not None:
+#             attn_weights = attn_weights * head_mask
 
-        attn_output = torch.matmul(attn_weights, value)
+#         attn_output = torch.matmul(attn_weights, value)
 
-        return attn_output, attn_weights
+#         return attn_output, attn_weights
 
-    def _split_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Splits hidden_size dim into attn_head_size and num_heads
-        """
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-        tensor = tensor.view(new_shape)
-        return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+#     def _split_heads(self, tensor, num_heads, attn_head_size):
+#         """
+#         Splits hidden_size dim into attn_head_size and num_heads
+#         """
+#         new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+#         tensor = tensor.view(new_shape)
+#         return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
 
-    def _merge_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Merges attn_head_size dim and num_attn_heads dim into hidden_size
-        """
-        tensor = tensor.permute(0, 2, 1, 3).contiguous()
-        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
-        return tensor.view(new_shape)
+#     def _merge_heads(self, tensor, num_heads, attn_head_size):
+#         """
+#         Merges attn_head_size dim and num_attn_heads dim into hidden_size
+#         """
+#         tensor = tensor.permute(0, 2, 1, 3).contiguous()
+#         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
+#         return tensor.view(new_shape)
 
-    def rotation_generate(self, hidden_states):
-        output_list = [None for _ in range(self.world_size)]
-        for i in range(self.world_size):
-            hidden_states = _RotationParallelRegion.apply(hidden_states, self, i)
-            output_list[(i + self.rank) % self.world_size] = self.c_attn(hidden_states)
-        hidden_states.buffer = None
-        hidden_states.reqs = None
+#     def rotation_generate(self, hidden_states):
+#         output_list = [None for _ in range(self.world_size)]
+#         for i in range(self.world_size):
+#             hidden_states = _RotationParallelRegion.apply(hidden_states, self, i)
+#             output_list[(i + self.rank) % self.world_size] = self.c_attn(hidden_states)
+#         hidden_states.buffer = None
+#         hidden_states.reqs = None
         
-        query, key, value = torch.cat(output_list, dim=1).contiguous().split(self.split_size, dim=2)
+#         query, key, value = torch.cat(output_list, dim=1).contiguous().split(self.split_size, dim=2)
 
-        return query, key, value
+#         return query, key, value
         
-    def forward(
-        self,
-        hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
-        if encoder_hidden_states is not None:
-            if not hasattr(self, "q_attn"):
-                raise ValueError(
-                    "If class is used as cross attention, the weights `q_attn` have to be defined. "
-                    "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
-                )
+#     def forward(
+#         self,
+#         hidden_states: Optional[Tuple[torch.FloatTensor]],
+#         layer_past: Optional[Tuple[torch.Tensor]] = None,
+#         attention_mask: Optional[torch.FloatTensor] = None,
+#         head_mask: Optional[torch.FloatTensor] = None,
+#         encoder_hidden_states: Optional[torch.Tensor] = None,
+#         encoder_attention_mask: Optional[torch.FloatTensor] = None,
+#         use_cache: Optional[bool] = False,
+#         output_attentions: Optional[bool] = False,
+#     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
+#         if encoder_hidden_states is not None:
+#             if not hasattr(self, "q_attn"):
+#                 raise ValueError(
+#                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
+#                     "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
+#                 )
 
-            query = self.q_attn(hidden_states)
-            key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
-            attention_mask = encoder_attention_mask
-        else:
-            query, key, value = self.rotation_generate(hidden_states)
+#             query = self.q_attn(hidden_states)
+#             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
+#             attention_mask = encoder_attention_mask
+#         else:
+#             query, key, value = self.rotation_generate(hidden_states)
 
-        query = self._split_heads(query, self.num_heads, self.head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim)
+#         query = self._split_heads(query, self.num_heads, self.head_dim)
+#         key = self._split_heads(key, self.num_heads, self.head_dim)
+#         value = self._split_heads(value, self.num_heads, self.head_dim)
         
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+#         if layer_past is not None:
+#             past_key, past_value = layer_past
+#             key = torch.cat((past_key, key), dim=-2)
+#             value = torch.cat((past_value, value), dim=-2)
 
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
+#         if use_cache is True:
+#             present = (key, value)
+#         else:
+#             present = None
 
-        if self.reorder_and_upcast_attn:
-            attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
-        else:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+#         if self.reorder_and_upcast_attn:
+#             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
+#         else:
+#             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        attn_output = self.c_proj(attn_output)
-        attn_output = _ReduceScatterToSequenceParallelRegion.apply(attn_output)
-        attn_output = self.resid_dropout(attn_output)
+#         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
+#         attn_output = self.c_proj(attn_output)
+#         attn_output = _ReduceScatterToSequenceParallelRegion.apply(attn_output)
+#         attn_output = self.resid_dropout(attn_output)
 
-        outputs = (attn_output, present)
-        if output_attentions:
-            outputs += (attn_weights,)
+#         outputs = (attn_output, present)
+#         if output_attentions:
+#             outputs += (attn_weights,)
 
-        return outputs  # a, present, (attentions)
+#         return outputs  # a, present, (attentions)
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -631,31 +632,25 @@ class LlamaSdpaAttention(nn.Module):
         query_list = [None for _ in range(self.world_size)]
         key_list = [None for _ in range(self.world_size)]
         value_list = [None for _ in range(self.world_size)]
-        self.query_list = [None for _ in range(self.world_size)]
-        self.key_list = [None for _ in range(self.world_size)]
-        self.value_list = [None for _ in range(self.world_size)]
+        
         for i in range(self.world_size):
             hidden_states = _RotationParallelRegion.apply(hidden_states, self, i)
-            query_list[(i + self.rank) % self.world_size] = self.q_proj(hidden_states)
-            key_list[(i + self.rank) % self.world_size] = self.k_proj(hidden_states)
-            value_list[(i + self.rank) % self.world_size] = self.v_proj(hidden_states)
-            query_list[(i + self.rank) % self.world_size] = _RotationParallelRegion_all.apply(query_list[(i + self.rank) % self.world_size], self, i, 'query_list')
-            key_list[(i + self.rank) % self.world_size] = _RotationParallelRegion_all.apply(key_list[(i + self.rank) % self.world_size], self, i, 'key_list')
-            value_list[(i + self.rank) % self.world_size] = _RotationParallelRegion_all.apply(value_list[(i + self.rank) % self.world_size], self, i, 'value_list')
+            query = self.q_proj(hidden_states)
+            key = self.k_proj(hidden_states)
+            value = self.v_proj(hidden_states)
+
+            if self.rank == 0:
+                print('----------------------------')
+                print(self.rank, self.q_proj.weight[0], self.k_proj.weight[0], self.v_proj.weight[0])
+            
+            query, key, value = _RotationParallelRegion_all.apply(self, query, key, value, query_list, key_list, value_list, i, (i + self.rank) % self.world_size)
+            
+            query_list[(i + self.rank) % self.world_size] = query
+            key_list[(i + self.rank) % self.world_size] = key
+            value_list[(i + self.rank) % self.world_size] = value
 
         for req in self.all_reqs:
             req.wait()
-
-        
-        for i in range(1, self.world_size):
-            query_list[(i + self.rank) % self.world_size] = self.query_list[i]
-            key_list[(i + self.rank) % self.world_size] = self.key_list[i]
-            value_list[(i + self.rank) % self.world_size] = self.value_list[i]
-        
-        self.query_list = [None for _ in range(self.world_size)]
-        self.key_list = [None for _ in range(self.world_size)]
-        self.value_list = [None for _ in range(self.world_size)]
-        
         query = torch.cat(query_list, dim=1).contiguous()
         key = torch.cat(key_list, dim=1).contiguous()
         value = torch.cat(value_list, dim=1).contiguous()

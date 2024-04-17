@@ -201,6 +201,10 @@ def benchmark_dp(rank, args, world_size):
         outputs[0].mean().backward()
         ref[0].mean().backward()
 
+        for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
+            p1[1].grad = None
+            p2[1].grad = None
+
         # ## oritp
         # for name, p in orisqattention.named_parameters():
         #     if p.grad is not None:
