@@ -217,18 +217,38 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         ctx.module = module
         ctx.itr = itr
         ctx.name = name
+        print(itr)
         buffer_list = getattr(module, name)
         if itr != 0:
             buffer_list[itr] = torch.zeros_like(input_)
             module.all_reqs = _right_rotation(input_.data, buffer_list[itr], itr)
             return input_
+        else:
+            return input_
 
     @staticmethod
     def backward(ctx, grad_output):
+        print('class _RotationParallelRegion_all(torch.autograd.Function):')
         module = ctx.module
         itr = ctx.itr
         name = ctx.name
-        return grad_output, None, None
+
+        if itr != 0:
+            for req in module.reqs:
+                req.wait()
+            module.flat_param.data.copy_(module._buffer)
+        
+        if itr != torch.distributed.get_world_size() - 1:
+            buffer = torch.zeros_like(grad_output)
+            reqs = _left_rotation(grad_output, buffer, itr)
+            for req in reqs:
+                req.wait()
+            grad_output.data.copy_(buffer)
+            buffer = None
+            
+            return grad_output, None, None, None
+        else:
+            return grad_output, None, None, None`
     
 class _RotationParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
@@ -244,48 +264,36 @@ class _RotationParallelRegion(torch.autograd.Function):
         
         if itr == 0:
             module._buffer = torch.zeros_like(module.flat_param)
-            module.reqs = _left_rotation(module.flat_param.data, module._buffer, itr+1)
+            module.reqs = _left_rotation(module.flat_param.data, module._buffer, 1)
             return input_
         else:
             for req in module.reqs:
                 req.wait()
             module.flat_param.data.copy_(module._buffer)
             if itr != torch.distributed.get_world_size() - 1:
-                module.reqs = _left_rotation(module.flat_param.data, module._buffer, itr+1)
+                module.reqs = _left_rotation(module.flat_param.data, module._buffer, 1)
             else:
                 module._buffer = None
             return input_
 
     @staticmethod
     def backward(ctx, grad_output):
+        print('class _RotationParallelRegion(torch.autograd.Function):')
         module = ctx.module
         itr = ctx.itr
-        # input_ = ctx.saved_tensors[0]
-        # if itr == torch.distributed.get_world_size() - 1:
-        #     module._buffer = torch.zeros_like(input_)
-        #     module.reqs = _right_rotation(input_, module._buffer)
-        #     for req in module.reqs:
-        #         req.wait()
-        #     input_.data.copy_(module._buffer)
-        #     module.reqs = _right_rotation(grad_output, module._buffer)
-        #     for req in module.reqs:
-        #         req.wait()
-        #     grad_output = module._buffer
-        #     return grad_output, None, None
-        # else:
-        #     if itr != 0:
-        #         module.reqs = _right_rotation(input_, module._buffer)
-        #         for req in module.reqs:
-        #             req.wait()
-        #         input_.data.copy_(module._buffer)
-        #         module.reqs = _right_rotation(grad_output, module._buffer)
-        #         for req in module.reqs:
-        #             req.wait()
-        #         grad_output = module._buffer
-        #     else:
-        #         module._buffer = None
-        #     return grad_output, None, None
-        return grad_output, None, None
+
+        print(itr)
+        
+        if itr == torch.distributed.get_world_size() - 1:
+            module._buffer = torch.zeros_like(module.flat_param)
+            module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
+            return grad_output, None, None
+        else:
+            if itr != 0:
+                module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
+            else:
+                module._buffer = None
+            return grad_output, None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
@@ -631,9 +639,9 @@ class LlamaSdpaAttention(nn.Module):
             query_list[(i + self.rank) % self.world_size] = self.q_proj(hidden_states)
             key_list[(i + self.rank) % self.world_size] = self.k_proj(hidden_states)
             value_list[(i + self.rank) % self.world_size] = self.v_proj(hidden_states)
-            _RotationParallelRegion_all.apply(query_list[(i + self.rank) % self.world_size], self, i, 'query_list')
-            _RotationParallelRegion_all.apply(key_list[(i + self.rank) % self.world_size], self, i, 'key_list')
-            _RotationParallelRegion_all.apply(value_list[(i + self.rank) % self.world_size], self, i, 'value_list')
+            query_list[(i + self.rank) % self.world_size] = _RotationParallelRegion_all.apply(query_list[(i + self.rank) % self.world_size], self, i, 'query_list')
+            key_list[(i + self.rank) % self.world_size] = _RotationParallelRegion_all.apply(key_list[(i + self.rank) % self.world_size], self, i, 'key_list')
+            value_list[(i + self.rank) % self.world_size] = _RotationParallelRegion_all.apply(value_list[(i + self.rank) % self.world_size], self, i, 'value_list')
 
         for req in self.all_reqs:
             req.wait()
