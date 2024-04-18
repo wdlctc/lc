@@ -213,43 +213,90 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         return _left_rotation(input_)
 
     @staticmethod
-    def forward(ctx, module, query, key, value, query_list, key_list, value_list, itr, index):
+    def forward(ctx, module, query, key, value, query_buffer, key_buffer, value_buffer, itr, index):
         ctx.module = module
         ctx.itr = itr
-        print('_RotationParallelRegion_all(torch.autograd.Function):')
-        print(itr)
+        ctx.index = index
+        bsz, q_len, _ = query.size()
+        ctx.q_len = q_len
         if itr == 0:
-            query_list[index] = query
-            key_list[index] = key
-            value_list[index] = value
+            query_buffer[:, q_len*index:q_len*(index + 1), :] = query
+            key_buffer[:, q_len*index:q_len*(index + 1), :] = key
+            value_buffer[:, q_len*index:q_len*(index + 1), :] = value
         else:
-            query_list[index] = torch.zeros_like(query)
-            key_list[index] = torch.zeros_like(key)
-            value_list[index] = torch.zeros_like(value)
-            module.all_reqs = _right_rotation(query, query_list[index], itr) + _right_rotation(key, key_list[index], itr) + _right_rotation(value, value_list[index], itr)
-        return query_list[index], key_list[index], value_list[index]
+            pass
+            # query_buffer[:, q_len*index:q_len*(index + 1), :] = query
+            # key_buffer[:, q_len*index:q_len*(index + 1), :] = key
+            # value_buffer[:, q_len*index:q_len*(index + 1), :] = value
+            q = query_buffer[:, q_len*index:q_len*(index + 1), :]
+            k = key_buffer[:, q_len*index:q_len*(index + 1), :]
+            v = value_buffer[:, q_len*index:q_len*(index + 1), :]
+            module.all_reqs = _right_rotation(query, q, itr) + _right_rotation(key, k, itr) + _right_rotation(value, v, itr)
+        return query_buffer, key_buffer, value_buffer
 
     @staticmethod
-    def backward(ctx, query, key, value):
+    def backward(ctx, query_buffer, key_buffer, value_buffer):
         module = ctx.module
         itr = ctx.itr
+        index = ctx.index
+        q_len = ctx.q_len
+
+        group = torch.distributed.distributed_c10d._get_default_group()
+        rank = torch.distributed.get_rank(group)
+        world_size = torch.distributed.get_world_size(group)
+        
+        if itr == torch.distributed.get_world_size() - 1:
+            module._full_grad = torch.zeros_like(module.flat_param)
+            cur_numel = 0
+            for param in module.param_list:
+                param.grad = module._full_grad[cur_numel: cur_numel + param.numel()].view(param.shape)
+                cur_numel += param.numel()
 
         if itr != torch.distributed.get_world_size() - 1:
             for req in module.reqs:
                 req.wait()
+            for req in module.grad_reqs:
+                req.wait()
             module.flat_param.data.copy_(module._buffer)
+            module._full_grad.data.copy_(module._grad_buffer)
         
-        if itr != 0:
-            # buffer = torch.zeros_like(grad_output)
-            # reqs = _left_rotation(grad_output, buffer, itr)
-            # for req in reqs:
-            #     req.wait()
-            # grad_output.data.copy_(buffer)
-            # buffer = None
+        if itr == torch.distributed.get_world_size() - 1:
+            query_buffer_ = query_buffer.clone().detach()
+            key_buffer_ = key_buffer.clone().detach()
+            value_buffer_ = value_buffer.clone().detach()
+            req_list = [None for _ in range(world_size)]
+            for i in range(world_size-1, 0, -1):
+                if i == 0:
+                    continue
+                index = (i + rank) % world_size
+                query_ = query_buffer_[:, q_len*index:q_len*(index + 1), :] 
+                key_ = key_buffer_[:, q_len*index:q_len*(index + 1), :] 
+                value_ = value_buffer_[:, q_len*index:q_len*(index + 1), :] 
+                
+                query = query_buffer[:, q_len*index:q_len*(index + 1), :] 
+                key = key_buffer[:, q_len*index:q_len*(index + 1), :] 
+                value = value_buffer[:, q_len*index:q_len*(index + 1), :] 
+                
+                    
+                reqs = _left_rotation(query_, query, i) + _left_rotation(key_, key, i) + _left_rotation(value_, value, i)
+                req_list[i] = reqs
+            module.req_list = req_list
             
-            return None, query, key, value, None, None, None, None, None
+        index = (itr + rank) % world_size
+        if itr != 0:
+            for req in module.req_list[i]:
+                req.wait()
+            
+            query = query_buffer[:, q_len*index:q_len*(index + 1), :] 
+            key = key_buffer[:, q_len*index:q_len*(index + 1), :] 
+            value = value_buffer[:, q_len*index:q_len*(index + 1), :] 
+            
+            return None, query, key, value, query_buffer, key_buffer, value_buffer, None, None
         else:
-            return None, query, key, value, None, None, None, None, None
+            query = query_buffer[:, q_len*index:q_len*(index + 1), :] 
+            key = key_buffer[:, q_len*index:q_len*(index + 1), :] 
+            value = value_buffer[:, q_len*index:q_len*(index + 1), :] 
+            return None, query, key, value, query_buffer, key_buffer, value_buffer, None, None
     
 class _RotationParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
@@ -279,21 +326,21 @@ class _RotationParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        print('class _RotationParallelRegion(torch.autograd.Function):')
         module = ctx.module
         itr = ctx.itr
 
-        print(itr)
-        
         if itr == torch.distributed.get_world_size() - 1:
             module._buffer = torch.zeros_like(module.flat_param)
+            module._grad_buffer = torch.zeros_like(module.flat_param)
             module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
+            module.grad_reqs = _left_rotation(module._full_grad.data, module._grad_buffer, 1)
             return grad_output, None, None
         else:
             if itr != 0:
                 module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
             else:
                 module._buffer = None
+                module._grad_buffer = None
             return grad_output, None, None
 
 
@@ -629,9 +676,11 @@ class LlamaSdpaAttention(nn.Module):
             cur_numel += param.numel()
     
     def rotation_generate(self, hidden_states):
-        query_list = [None for _ in range(self.world_size)]
-        key_list = [None for _ in range(self.world_size)]
-        value_list = [None for _ in range(self.world_size)]
+
+        bsz, q_len, _ = hidden_states.size()
+        query_buffer = torch.zeros((bsz, q_len * self.world_size, self.num_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
+        key_buffer = torch.zeros((bsz, q_len * self.world_size, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
+        value_buffer = torch.zeros((bsz, q_len * self.world_size, self.num_key_value_heads * self.head_dim), device=hidden_states.device, dtype=hidden_states.dtype)
         
         for i in range(self.world_size):
             hidden_states = _RotationParallelRegion.apply(hidden_states, self, i)
@@ -639,23 +688,14 @@ class LlamaSdpaAttention(nn.Module):
             key = self.k_proj(hidden_states)
             value = self.v_proj(hidden_states)
 
-            if self.rank == 0:
-                print('----------------------------')
-                print(self.rank, self.q_proj.weight[0], self.k_proj.weight[0], self.v_proj.weight[0])
+
+            query_buffer, key_buffer, value_buffer = _RotationParallelRegion_all.apply(self, query, key, value, query_buffer, key_buffer, value_buffer, i, (i + self.rank) % self.world_size)
             
-            query, key, value = _RotationParallelRegion_all.apply(self, query, key, value, query_list, key_list, value_list, i, (i + self.rank) % self.world_size)
-            
-            query_list[(i + self.rank) % self.world_size] = query
-            key_list[(i + self.rank) % self.world_size] = key
-            value_list[(i + self.rank) % self.world_size] = value
 
         for req in self.all_reqs:
             req.wait()
-        query = torch.cat(query_list, dim=1).contiguous()
-        key = torch.cat(key_list, dim=1).contiguous()
-        value = torch.cat(value_list, dim=1).contiguous()
         
-        return query, key, value
+        return query_buffer, key_buffer, value_buffer
         
     # Adapted from LlamaAttention.forward
     def forward(
