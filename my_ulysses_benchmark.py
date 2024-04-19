@@ -110,9 +110,9 @@ def benchmark_dp(rank, args, world_size):
     from sp import OriSequenceParallel, TpSequenceParallel, UlyssesParallel, RtpParallel
 
     # sp_model = DDP(OriSequenceParallel(model))
-    sp_model = TpSequenceParallel(model)
+    # sp_model = TpSequenceParallel(model)
     # sp_model = DDP(UlyssesParallel(model))
-    # sp_model = FullyShardedDataParallel(UlyssesParallel(model))
+    sp_model = FullyShardedDataParallel(UlyssesParallel(model))
     # sp_model = RtpParallel(model)
     print(sp_model)
     optimizer = AdamW(sp_model.parameters(), lr=5e-5)

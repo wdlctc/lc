@@ -252,13 +252,13 @@ class _RotationParallelRegion_all(torch.autograd.Function):
                 param.grad = module._full_grad[cur_numel: cur_numel + param.numel()].view(param.shape)
                 cur_numel += param.numel()
 
-        if itr != torch.distributed.get_world_size() - 1:
-            for req in module.reqs:
-                req.wait()
-            for req in module.grad_reqs:
-                req.wait()
-            module.flat_param.data.copy_(module._buffer)
-            module._full_grad.data.copy_(module._grad_buffer)
+        # if itr != torch.distributed.get_world_size() - 1:
+        #     for req in module.reqs:
+        #         req.wait()
+        #     for req in module.grad_reqs:
+        #         req.wait()
+        #     module.flat_param.data.copy_(module._buffer)
+        #     module._full_grad.data.copy_(module._grad_buffer)
         
         if itr == torch.distributed.get_world_size() - 1:
             query_buffer_ = query_buffer.clone().detach()
@@ -329,15 +329,31 @@ class _RotationParallelRegion(torch.autograd.Function):
         module = ctx.module
         itr = ctx.itr
 
+        for param in module.param_list:
+            print(param.grad)
+            
         if itr == torch.distributed.get_world_size() - 1:
             module._buffer = torch.zeros_like(module.flat_param)
             module._grad_buffer = torch.zeros_like(module.flat_param)
             module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
-            module.grad_reqs = _left_rotation(module._full_grad.data, module._grad_buffer, 1)
+            module.grad_reqs = _right_rotation(module._full_grad.data, module._grad_buffer, 1)
+            for req in module.reqs:
+                req.wait()
+            for req in module.grad_reqs:
+                req.wait()
+            module.flat_param.data.copy_(module._buffer)
+            module._full_grad.data.copy_(module._grad_buffer)
             return grad_output, None, None
         else:
             if itr != 0:
                 module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
+                module.grad_reqs = _right_rotation(module._full_grad.data, module._grad_buffer, 1)
+                for req in module.reqs:
+                    req.wait()
+                for req in module.grad_reqs:
+                    req.wait()
+                module.flat_param.data.copy_(module._buffer)
+                module._full_grad.data.copy_(module._grad_buffer)
             else:
                 module._buffer = None
                 module._grad_buffer = None
