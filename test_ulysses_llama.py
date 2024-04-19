@@ -168,7 +168,7 @@ def benchmark_dp(rank, args, world_size):
     )
     # Set up the optimizer
     # Training loop
-    num_epochs = 1
+    num_epochs = 5
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
@@ -195,11 +195,11 @@ def benchmark_dp(rank, args, world_size):
         # print(output_list[rank], ref)
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
 
-        # inputs.retain_grad()
-        # seq_inputs.retain_grad()
+        inputs.retain_grad()
+        seq_inputs.retain_grad()
         
-        # outputs[0].mean().backward()
-        # ref[0].mean().backward()
+        outputs[0].mean().backward()
+        ref[0].mean().backward()
 
 
         # ## oritp

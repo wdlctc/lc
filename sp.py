@@ -632,7 +632,7 @@ class _RotationParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, module, itr, index):
         ctx.module = module
         ctx.itr = itr
-        ctx.save_for_backward(input_)
+        # ctx.save_for_backward(input_)
         if itr == 0:
             module._buffer = torch.zeros_like(module.flat_param)
             module.reqs = _left_rotation(module.flat_param.data, module._buffer, 1)
@@ -651,32 +651,33 @@ class _RotationParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         module = ctx.module
         itr = ctx.itr
-        input_ = ctx.saved_tensors[0]
+        # input_ = ctx.saved_tensors[0]
         if itr == torch.distributed.get_world_size() - 1:
-            module._buffer = torch.zeros_like(input_)
-            module.reqs = _right_rotation(input_, module._buffer, 1)
+            module._buffer = torch.zeros_like(module.flat_param)
+            module._grad_buffer = torch.zeros_like(module.flat_param)
+            module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
+            module.grad_reqs = _right_rotation(module._full_grad.data, module._grad_buffer, 1)
             for req in module.reqs:
                 req.wait()
-            input_.data.copy_(module._buffer)
-            module.reqs = _right_rotation(grad_output, module._buffer, 1)
-            for req in module.reqs:
+            for req in module.grad_reqs:
                 req.wait()
-            grad_output = module._buffer
+            module.flat_param.data.copy_(module._buffer)
+            module._full_grad.data.copy_(module._grad_buffer)
             return grad_output, None, None, None
         else:
             if itr != 0:
-                module.reqs = _right_rotation(input_, module._buffer)
+                module.reqs = _right_rotation(module.flat_param.data, module._buffer, 1)
+                module.grad_reqs = _right_rotation(module._full_grad.data, module._grad_buffer, 1)
                 for req in module.reqs:
                     req.wait()
-                input_.data.copy_(module._buffer)
-                module.reqs = _right_rotation(grad_output, module._buffer)
-                for req in module.reqs:
+                for req in module.grad_reqs:
                     req.wait()
-                grad_output = module._buffer
+                module.flat_param.data.copy_(module._buffer)
+                module._full_grad.data.copy_(module._grad_buffer)
             else:
                 module._buffer = None
+                module._grad_buffer = None
             return grad_output, None, None, None
-
 
 class _RotationParallelRegion_all(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
@@ -687,16 +688,17 @@ class _RotationParallelRegion_all(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_, buffer, module, itr, index):
+        bsz, q_len, _ = input_.size()
+        
         ctx.module = module
         ctx.itr = itr
-        bsz, q_len, _ = input_.size()
         ctx.q_len = q_len
         ctx.index = index
+        
         if itr == 0:
-            buffer[index] = input_
+            buffer[:, q_len*index:q_len*(index + 1), :] = input_
         else:
-            buffer[index] = torch.zeros_like(input_)
-            module.all_reqs = _right_rotation(input_, buffer[index], itr)
+            module.all_reqs = _right_rotation(input_, buffer[:, q_len*index:q_len*(index + 1), :] , itr)
             if itr == torch.distributed.get_world_size() - 1:
                 for req in module.all_reqs:
                     req.wait()
@@ -712,6 +714,8 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         group = torch.distributed.distributed_c10d._get_default_group()
         rank = torch.distributed.get_rank(group)
         world_size = torch.distributed.get_world_size(group)
+
+        grad = grad_output[:, q_len*index:q_len*(index + 1), :]
         
         if itr == torch.distributed.get_world_size() - 1:
             module._full_grad = torch.zeros_like(module.flat_param)
@@ -729,8 +733,8 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         #     module.flat_param.data.copy_(module._buffer)
         #     module._full_grad.data.copy_(module._grad_buffer)
         
-        if itr == torch.distributed.get_world_size() - 1:
-            return grad_output
+        return grad, None, None, None, None
+
 class RtpLinearWarpper(nn.Module):
     def __init__(
         self,
@@ -745,6 +749,7 @@ class RtpLinearWarpper(nn.Module):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.pre = pre
+        self.out_features = self.module.out_features
 
         param_list = list(module.parameters())
 
@@ -776,6 +781,8 @@ class RtpLinearWarpper(nn.Module):
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         output_list = [None for _ in range(self.world_size)]
 
+        
+
         if self.pre:
             inputs = all_to_all(inputs, self.group, scatter_dim=1, gather_dim=-1)
             for i in range(self.world_size):
@@ -784,15 +791,16 @@ class RtpLinearWarpper(nn.Module):
                 outputs = self.module_list[index](inputs, **kwargs)
                 output_list[index] = outputs
         else:
+            inputs = args[0]
+            bsz, q_len, _ = inputs.size()
+            outputs_buffer = torch.zeros((bsz, q_len * self.world_size, self.out_features // self.world_size), device=inputs.device, dtype=inputs.dtype)
             for i in range(self.world_size):
                 index = (self.rank + i +self.world_size) % self.world_size
-                inputs = _RotationParallelRegion.apply(args[0], self, i, index)
+                inputs = _RotationParallelRegion.apply(inputs, self, i, index)
                 outputs = self.module_list[index](inputs, **kwargs)
-                output_list = _RotationParallelRegion_all.apply(outputs, output_list, self, i, index)
-    
-            outputs = torch.cat(output_list, dim=1).contiguous()
+                outputs_buffer = _RotationParallelRegion_all.apply(outputs, outputs_buffer, self, i, index)
 
-        return outputs
+        return outputs_buffer
 
 
 class RtpWarpper(nn.Module):
