@@ -22,6 +22,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
+import copy
+
 import transformers
 
 from typing import (
@@ -563,105 +565,6 @@ class UlyssesParallel(nn.Module):
 
 ########################################################################
 
-
-def _left_rotation(input_, buffer):
-
-    group = torch.distributed.distributed_c10d._get_default_group()
-
-    # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size(group=group) == 1:
-        return input_
-
-    # Size and dimension.
-    rank = torch.distributed.get_rank(group=group)
-    world_size = torch.distributed.get_world_size(group=group)
-        
-    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank + 1)%world_size)
-    recv_op = torch.distributed.P2POp(torch.distributed.irecv, buffer, (rank - 1 + world_size)%world_size)
-
-    reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
-
-    return reqs
-
-
-def _right_rotation(input_, buffer):
-
-    group = torch.distributed.distributed_c10d._get_default_group()
-
-    # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size(group=group) == 1:
-        return input_
-
-    # Size and dimension.
-    rank = torch.distributed.get_rank(group=group)
-    world_size = torch.distributed.get_world_size(group=group)
-        
-    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank - 1 + world_size)%world_size)
-    recv_op = torch.distributed.P2POp(torch.distributed.irecv, buffer, (rank + 1)%world_size)
-
-    reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
-
-    return reqs
-    
-    
-class _RotationParallelRegion(torch.autograd.Function):
-    """Reduce scatter the input from the model parallel region."""
-
-    @staticmethod
-    def symbolic(graph, input_, module, itr):
-        return _left_rotation(input_)
-
-    @staticmethod
-    def forward(ctx, input_, module, itr):
-        ctx.module = module
-        ctx.itr = itr
-        ctx.save_for_backward(input_)
-        if itr == 0:
-            module._buffer = torch.zeros_like(input_)
-            module.reqs = _left_rotation(input_, module._buffer)
-            return input_
-        else:
-            for req in module.reqs:
-                req.wait()
-            input_.data.copy_(module._buffer)
-            if itr != torch.distributed.get_world_size() - 1:
-                module.reqs = _left_rotation(input_, module._buffer)
-            else:
-                module._buffer = None
-            return input_
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        module = ctx.module
-        itr = ctx.itr
-        input_ = ctx.saved_tensors[0]
-        if itr == torch.distributed.get_world_size() - 1:
-            module._buffer = torch.zeros_like(input_)
-            module.reqs = _right_rotation(input_, module._buffer)
-            for req in module.reqs:
-                req.wait()
-            input_.data.copy_(module._buffer)
-            module.reqs = _right_rotation(grad_output, module._buffer)
-            for req in module.reqs:
-                req.wait()
-            grad_output = module._buffer
-            return grad_output, None, None
-        else:
-            if itr != 0:
-                module.reqs = _right_rotation(input_, module._buffer)
-                for req in module.reqs:
-                    req.wait()
-                input_.data.copy_(module._buffer)
-                module.reqs = _right_rotation(grad_output, module._buffer)
-                for req in module.reqs:
-                    req.wait()
-                grad_output = module._buffer
-            else:
-                module._buffer = None
-            return grad_output, None, None
-        return grad_output, None, None
-
-
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
@@ -677,6 +580,157 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         return _gather_along_first_dim(grad_output)
 
+
+def _left_rotation(input_, buffer, i):
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+
+    # Bypass the function if we are using only 1 GPU.
+    if torch.distributed.get_world_size(group=group) == 1:
+        return input_
+
+    # Size and dimension.
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+        
+    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank + i)%world_size)
+    recv_op = torch.distributed.P2POp(torch.distributed.irecv, buffer, (rank - i + world_size)%world_size)
+
+    reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
+
+    return reqs
+
+
+def _right_rotation(input_, buffer, i):
+
+    group = torch.distributed.distributed_c10d._get_default_group()
+
+    # Bypass the function if we are using only 1 GPU.
+    if torch.distributed.get_world_size(group=group) == 1:
+        return input_
+
+    # Size and dimension.
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+        
+    send_op = torch.distributed.P2POp(torch.distributed.isend, input_, (rank - i + world_size)%world_size)
+    recv_op = torch.distributed.P2POp(torch.distributed.irecv, buffer, (rank + i)%world_size)
+
+    reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
+
+    return reqs
+
+
+class _RotationParallelRegion(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(graph, input_, module, itr, index):
+        return _left_rotation(input_)
+
+    @staticmethod
+    def forward(ctx, input_, module, itr, index):
+        ctx.module = module
+        ctx.itr = itr
+        ctx.save_for_backward(input_)
+        if itr == 0:
+            module._buffer = torch.zeros_like(module.flat_param)
+            module.reqs = _left_rotation(module.flat_param.data, module._buffer, 1)
+            return input_
+        else:
+            for req in module.reqs:
+                req.wait()
+            module.flat_param.data.copy_(module._buffer)
+            if itr != torch.distributed.get_world_size() - 1:
+                module.reqs = _left_rotation(module.flat_param.data, module._buffer, 1)
+            else:
+                module._buffer = None
+            return input_
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        module = ctx.module
+        itr = ctx.itr
+        input_ = ctx.saved_tensors[0]
+        if itr == torch.distributed.get_world_size() - 1:
+            module._buffer = torch.zeros_like(input_)
+            module.reqs = _right_rotation(input_, module._buffer, 1)
+            for req in module.reqs:
+                req.wait()
+            input_.data.copy_(module._buffer)
+            module.reqs = _right_rotation(grad_output, module._buffer, 1)
+            for req in module.reqs:
+                req.wait()
+            grad_output = module._buffer
+            return grad_output, None, None, None
+        else:
+            if itr != 0:
+                module.reqs = _right_rotation(input_, module._buffer)
+                for req in module.reqs:
+                    req.wait()
+                input_.data.copy_(module._buffer)
+                module.reqs = _right_rotation(grad_output, module._buffer)
+                for req in module.reqs:
+                    req.wait()
+                grad_output = module._buffer
+            else:
+                module._buffer = None
+            return grad_output, None, None, None
+
+
+class _RotationParallelRegion_all(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(ctx, input_, buffer, module, itr, index):
+        return _left_rotation(input_)
+
+    @staticmethod
+    def forward(ctx, input_, buffer, module, itr, index):
+        ctx.module = module
+        ctx.itr = itr
+        bsz, q_len, _ = input_.size()
+        ctx.q_len = q_len
+        ctx.index = index
+        if itr == 0:
+            buffer[index] = input_
+        else:
+            buffer[index] = torch.zeros_like(input_)
+            module.all_reqs = _right_rotation(input_, buffer[index], itr)
+            if itr == torch.distributed.get_world_size() - 1:
+                for req in module.all_reqs:
+                    req.wait()
+        return buffer
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        module = ctx.module
+        itr = ctx.itr
+        index = ctx.index
+        q_len = ctx.q_len
+
+        group = torch.distributed.distributed_c10d._get_default_group()
+        rank = torch.distributed.get_rank(group)
+        world_size = torch.distributed.get_world_size(group)
+        
+        if itr == torch.distributed.get_world_size() - 1:
+            module._full_grad = torch.zeros_like(module.flat_param)
+            for sub_module in module.module_list:
+                cur_numel = 0
+                for param in sub_module.parameters():
+                    param.grad = module._full_grad[cur_numel: cur_numel + param.numel()].view(param.shape)
+                    cur_numel += param.numel()
+
+        # if itr != torch.distributed.get_world_size() - 1:
+        #     for req in module.reqs:
+        #         req.wait()
+        #     for req in module.grad_reqs:
+        #         req.wait()
+        #     module.flat_param.data.copy_(module._buffer)
+        #     module._full_grad.data.copy_(module._grad_buffer)
+        
+        if itr == torch.distributed.get_world_size() - 1:
+            return grad_output
 class RtpLinearWarpper(nn.Module):
     def __init__(
         self,
@@ -691,20 +745,53 @@ class RtpLinearWarpper(nn.Module):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.pre = pre
-        self.qkv = qkv
+
+        param_list = list(module.parameters())
+
+        self._param_numels = [p.numel() for p in param_list]
+
+        self.flat_param = torch.cat([p.detach().reshape(-1) if isinstance(p, nn.Parameter) else p.reshape(-1) for p in param_list], 0)
+        # self.flat_param = nn.Parameter(self.flat_param, requires_grad=param_list[0].requires_grad)
+
+        cur_numel = 0
+        for param in param_list:
+            param.data = self.flat_param[cur_numel: cur_numel + param.numel()].view(param.shape)
+            cur_numel += param.numel()
+
+        self.module_list = []
+        for i in range(self.world_size):
+            if i == self.rank:
+                sub_module = self.module
+                self.module_list.append(sub_module)
+                continue
+            sub_module = copy.deepcopy(self.module)
+
+            cur_numel = 0
+            for param in sub_module.parameters():
+                param.data = self.flat_param[cur_numel: cur_numel + param.numel()].view(param.shape)
+                cur_numel += param.numel()
+
+            self.module_list.append(sub_module)
         
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        output_list = [None for _ in range(self.world_size)]
 
-        inputs = args[0]
-    
         if self.pre:
             inputs = all_to_all(inputs, self.group, scatter_dim=1, gather_dim=-1)
-        outputs = self.module(inputs)
-        if not self.pre:
-            if self.qkv:
-                outputs_list = [t.contiguous() for t in torch.tensor_split(outputs, self.world_size * 3, -1)]
-                outputs = torch.cat([torch.cat([outputs_list[i + j * self.world_size] for j in range(3)], dim = -1) for i in range(self.world_size)], dim = -1)
-            outputs = all_to_all(outputs, self.group, scatter_dim=-1, gather_dim=1)
+            for i in range(self.world_size):
+                index = (self.rank + i +self.world_size) % self.world_size
+                inputs = _RotationParallelRegion.apply(inputs, self, i, index)
+                outputs = self.module_list[index](inputs, **kwargs)
+                output_list[index] = outputs
+        else:
+            for i in range(self.world_size):
+                index = (self.rank + i +self.world_size) % self.world_size
+                inputs = _RotationParallelRegion.apply(args[0], self, i, index)
+                outputs = self.module_list[index](inputs, **kwargs)
+                output_list = _RotationParallelRegion_all.apply(outputs, output_list, self, i, index)
+    
+            outputs = torch.cat(output_list, dim=1).contiguous()
+
         return outputs
 
 
@@ -727,6 +814,23 @@ class RtpWarpper(nn.Module):
             self.replace_linear('c_attn', self.module.c_attn, qkv=True)
             self.replace_linear('c_proj', self.module.c_proj, pre=True)
         elif isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+            
+            self.module.q_proj.weight = nn.Parameter(split_tensor(self.module.q_proj.weight, self.world_size, dim=0)[self.rank])
+            if self.module.q_proj.bias is not None:
+                self.module.q_proj.bias = nn.Parameter(split_tensor(self.module.q_proj.bias, self.world_size, dim=0)[self.rank])
+            
+            self.module.k_proj.weight = nn.Parameter(split_tensor(self.module.k_proj.weight, self.world_size, dim=0)[self.rank])
+            if self.module.k_proj.bias is not None:
+                self.module.k_proj.bias = nn.Parameter(split_tensor(self.module.k_proj.bias, self.world_size, dim=0)[self.rank])
+                
+            self.module.v_proj.weight = nn.Parameter(split_tensor(self.module.v_proj.weight, self.world_size, dim=0)[self.rank])
+            if self.module.v_proj.bias is not None:
+                self.module.v_proj.bias = nn.Parameter(split_tensor(self.module.v_proj.bias, self.world_size, dim=0)[self.rank])
+                
+            # self.module.o_proj.weight = nn.Parameter(split_tensor(self.module.o_proj.weight, self.world_size, dim=0)[self.rank])
+            # if self.module.o_proj.bias is not None:
+            #     self.module.o_proj.bias = nn.Parameter(split_tensor(self.module.o_proj.bias, self.world_size, dim=0)[self.rank])
+                
             self.module.num_heads = module.num_heads // self.world_size
             self.module.num_key_value_heads = module.num_key_value_heads // self.world_size
             self.module.hidden_size = module.hidden_size // self.world_size
@@ -734,7 +838,12 @@ class RtpWarpper(nn.Module):
             self.replace_linear('q_proj', self.module.q_proj)
             self.replace_linear('k_proj', self.module.k_proj)
             self.replace_linear('v_proj', self.module.v_proj)
-            self.replace_linear('o_proj', self.module.o_proj, pre=True)
+            self.replace_linear_u('o_proj', self.module.o_proj, pre=True)
+
+    
+    def replace_linear_u(self, name, module, pre=False, qkv=False):
+        module = LinearWarpper(module, self.group, pre, qkv)
+        setattr(self.module, name, module)
 
     def replace_linear(self, name, module, pre=False, qkv=True):
         module = RtpLinearWarpper(module, self.group, pre, qkv)
@@ -779,6 +888,7 @@ class RtpParallel(nn.Module):
                 self.RecursiveVisit(name, child, module)
         else:
             if isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
+                
                 module = RtpWarpper(module, self.group)
                 setattr(upper_module, name, module)
             if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):

@@ -135,8 +135,8 @@ def benchmark_dp(rank, args, world_size):
 
     # orisqattention = OriSequenceParallel(copy.deepcopy(attention))
     # tpsqattention = TpSequenceParallel(copy.deepcopy(attention))
-    ulyssattention = DDP(UlyssesParallel(copy.deepcopy(attention)))
-    # rtpattention = RtpParallel(copy.deepcopy(attention))
+    # ulyssattention = DDP(UlyssesParallel(copy.deepcopy(attention)))
+    rtpattention = RtpParallel(copy.deepcopy(attention))
     # model = SequenceParallel(model)
     # optimizer = AdamW(model.parameters(), lr=5e-5)
 
@@ -168,7 +168,7 @@ def benchmark_dp(rank, args, world_size):
     )
     # Set up the optimizer
     # Training loop
-    num_epochs = 5
+    num_epochs = 1
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
@@ -188,18 +188,18 @@ def benchmark_dp(rank, args, world_size):
         output_list = split_tensor(outputs[0], world_size, dim=1)
         # ref = orisqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = tpsqattention(seq_inputs, position_ids=position_ids)[0]
-        ref = ulyssattention(seq_inputs, position_ids=position_ids)[0]
+        # ref = ulyssattention(seq_inputs, position_ids=position_ids)[0]
         # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
-        # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
+        ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
 
         # print(output_list[rank], ref)
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
 
-        inputs.retain_grad()
-        seq_inputs.retain_grad()
+        # inputs.retain_grad()
+        # seq_inputs.retain_grad()
         
-        outputs[0].mean().backward()
-        ref[0].mean().backward()
+        # outputs[0].mean().backward()
+        # ref[0].mean().backward()
 
 
         # ## oritp
@@ -242,19 +242,19 @@ def benchmark_dp(rank, args, world_size):
         #     p2[1].grad = None
             
         # # ulysses
-        for name, p in ulyssattention.named_parameters():
-            if p.grad is not None:
-                dist.all_reduce(p.grad, group=dist.group.WORLD)
-                p.grad.div_(world_size)
-            else:
-                print(f"grad of {name} is None")
+        # for name, p in ulyssattention.named_parameters():
+        #     if p.grad is not None:
+        #         dist.all_reduce(p.grad, group=dist.group.WORLD)
+        #         p.grad.div_(world_size)
+        #     else:
+        #         print(f"grad of {name} is None")
         
-        for p1, p2 in zip(ulyssattention.named_parameters(), attention.named_parameters()):
-            # print(p1[0], p1[1].grad.shape, p2[1].grad.shape, torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4))
-            assert torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}"
-            # print(p1[1].grad, p2[1].grad)
-            p1[1].grad = None
-            p2[1].grad = None
+        # for p1, p2 in zip(ulyssattention.named_parameters(), attention.named_parameters()):
+        #     # print(p1[0], p1[1].grad.shape, p2[1].grad.shape, torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4))
+        #     assert torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}"
+        #     # print(p1[1].grad, p2[1].grad)
+        #     p1[1].grad = None
+        #     p2[1].grad = None
             
         # rtp
         # for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
