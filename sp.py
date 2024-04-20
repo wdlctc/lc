@@ -714,8 +714,6 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         group = torch.distributed.distributed_c10d._get_default_group()
         rank = torch.distributed.get_rank(group)
         world_size = torch.distributed.get_world_size(group)
-
-        print(itr)
         
         if itr == torch.distributed.get_world_size() - 1:
             module._full_grad = torch.zeros_like(module.flat_param)
