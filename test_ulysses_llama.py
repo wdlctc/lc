@@ -276,8 +276,8 @@ def benchmark_dp(rank, args, world_size):
         #     p1[1].grad = None
         #     p2[1].grad = None
 
-        # inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(2)
-        # assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-5), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
+        inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(2)
+        assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-5), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
         
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")

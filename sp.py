@@ -715,7 +715,7 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         rank = torch.distributed.get_rank(group)
         world_size = torch.distributed.get_world_size(group)
 
-        grad = grad_output[:, q_len*index:q_len*(index + 1), :]
+        print(itr)
         
         if itr == torch.distributed.get_world_size() - 1:
             module._full_grad = torch.zeros_like(module.flat_param)
@@ -725,15 +725,28 @@ class _RotationParallelRegion_all(torch.autograd.Function):
                     param.grad = module._full_grad[cur_numel: cur_numel + param.numel()].view(param.shape)
                     cur_numel += param.numel()
 
-        # if itr != torch.distributed.get_world_size() - 1:
-        #     for req in module.reqs:
-        #         req.wait()
-        #     for req in module.grad_reqs:
-        #         req.wait()
-        #     module.flat_param.data.copy_(module._buffer)
-        #     module._full_grad.data.copy_(module._grad_buffer)
+        if itr == torch.distributed.get_world_size() - 1:
+            grad_all = grad_output.clone().detach()
+            req_list = [None for _ in range(world_size)]
+            for i in range(world_size-1, 0, -1):
+                if i == 0:
+                    continue
+                
+                index = (i + rank) % world_size
+                buffer_ = grad_output[:, q_len*index:q_len*(index + 1), :]
+                grad = grad_all[:, q_len*index:q_len*(index + 1), :]
+                reqs = _left_rotation(grad, buffer_, i) 
+                req_list[i] = reqs
+            module.req_list = req_list
+            
+        index = ctx.index
         
-        return grad, None, None, None, None
+        if itr != 0:
+            for req in module.req_list[i]:
+                req.wait()
+                
+        grad = grad_output[:, q_len*index:q_len*(index + 1), :]
+        return grad, grad_output, None, None, None
 
 class RtpLinearWarpper(nn.Module):
     def __init__(
