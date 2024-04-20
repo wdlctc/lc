@@ -740,7 +740,7 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         index = ctx.index
         
         if itr != 0:
-            for req in module.req_list[i]:
+            for req in module.req_list[itr]:
                 req.wait()
                 
         grad = grad_output[:, q_len*index:q_len*(index + 1), :]
@@ -803,6 +803,7 @@ class RtpLinearWarpper(nn.Module):
                 output_list[index] = outputs
         else:
             inputs = args[0]
+
             bsz, q_len, _ = inputs.size()
             outputs_buffer = torch.zeros((bsz, q_len * self.world_size, self.out_features // self.world_size), device=inputs.device, dtype=inputs.dtype)
             for i in range(self.world_size):
@@ -810,6 +811,12 @@ class RtpLinearWarpper(nn.Module):
                 inputs = _RotationParallelRegion.apply(inputs, self, i, index)
                 outputs = self.module_list[index](inputs, **kwargs)
                 outputs_buffer = _RotationParallelRegion_all.apply(outputs, outputs_buffer, self, i, index)
+                
+            # if self.rank == 0:
+            #     print('---------------------------------')
+            #     print(self.module)
+            #     print(inputs.shape)
+            #     print(outputs_buffer.shape)
 
         return outputs_buffer
 
