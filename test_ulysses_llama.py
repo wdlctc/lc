@@ -189,8 +189,8 @@ def benchmark_dp(rank, args, world_size):
         # ref = orisqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = tpsqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = ulyssattention(seq_inputs, position_ids=position_ids)[0]
-        # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
         ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
+        # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
 
         # print(output_list[rank], ref)
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
@@ -228,14 +228,13 @@ def benchmark_dp(rank, args, world_size):
 
         #     if 'c_attn' in p1[0]:
         #         ref_list = split_tensor(p2[1].grad, world_size * 3, dim=tp_dim)
-        #         ref = torch.cat([ref_list[rank + i*world_size] for i in range(3)], dim = tp_dim).mul_(2)
+        #         ref = torch.cat([ref_list[rank + i*world_size] for i in range(3)], dim = tp_dim).mul_(world_size)
         #     elif tp_dim != None:
-        #         ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(2)
+        #         ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(world_size)
         #     else:
-        #         ref = p2[1].grad.mul_(2)
+        #         ref = p2[1].grad.mul_(world_size)
 
             
-        #     print(p1[0], p1[1].grad.shape,  p2[1].grad.shape)
         #     assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
         #     # print(p1[1].grad, ref)
         #     p1[1].grad = None
@@ -257,27 +256,27 @@ def benchmark_dp(rank, args, world_size):
         #     p2[1].grad = None
             
         # rtp
-        # for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
-        #     tp_dim = None
-        #     for i, dim in enumerate(p1[1].grad.shape):
-        #         if dim != p2[1].grad.shape[i]:
-        #             tp_dim = i
-        #             break
+        for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
+            tp_dim = None
+            for i, dim in enumerate(p1[1].grad.shape):
+                if dim != p2[1].grad.shape[i]:
+                    tp_dim = i
+                    break
 
-        #     if tp_dim != None:
-        #         ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(2)
-        #     else:
-        #         ref = p2[1].grad
+            if tp_dim != None:
+                ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(world_size)
+            else:
+                ref = p2[1].grad
             
-        #     # assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
-        #     if not torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4):
-        #         print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}")
-        #     # print(p1[1].grad, ref)
-        #     p1[1].grad = None
-        #     p2[1].grad = None
+            # assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
+            if not torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4):
+                print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}")
+            # print(p1[1].grad, ref)
+            p1[1].grad = None
+            p2[1].grad = None
 
-        # inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(2)
-        # assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-5), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
+        inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(world_size)
+        assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-5), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
         
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
