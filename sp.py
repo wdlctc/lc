@@ -925,9 +925,9 @@ class RtpLinearWarpper(nn.Module):
             bsz, q_len, out_features = inputs.size()
             outputs_buffer = None 
             for i in range(self.world_size):
-                index = (self.rank + i +self.world_size) % self.world_size
+                index = (self.rank - i +self.world_size) % self.world_size
                 # input_buffer = _RotationParallelRegion_one.apply(inputs, self, i, index)
-                input_buffer = inputs[:, :, out_features // self.world_size * index : out_features // self.world_size * (index + 1)]
+                input_buffer = inputs[:, :, (out_features // self.world_size) * index : (out_features // self.world_size) * (index + 1)]
                 input_buffer = _RotationParallelRegion.apply(input_buffer, self, i, index)
                 outputs = self.module_list[index](input_buffer, **kwargs)
                 outputs = _RotationParallelRegion_after.apply(outputs, self, i, index)
@@ -977,9 +977,9 @@ class RtpWarpper(nn.Module):
             if self.module.v_proj.bias is not None:
                 self.module.v_proj.bias = nn.Parameter(split_tensor(self.module.v_proj.bias, self.world_size, dim=0)[self.rank])
                 
-            self.module.o_proj.weight = nn.Parameter(split_tensor(self.module.o_proj.weight, self.world_size, dim=1)[self.rank])
-            if self.module.o_proj.bias is not None:
-                self.module.o_proj.bias.div_(self.world_size)
+            # self.module.o_proj.weight = nn.Parameter(split_tensor(self.module.o_proj.weight, self.world_size, dim=1)[self.rank])
+            # if self.module.o_proj.bias is not None:
+            #     self.module.o_proj.bias.div_(self.world_size)
                 
             self.module.num_heads = module.num_heads // self.world_size
             self.module.num_key_value_heads = module.num_key_value_heads // self.world_size
@@ -988,7 +988,7 @@ class RtpWarpper(nn.Module):
             self.replace_linear('q_proj', self.module.q_proj)
             self.replace_linear('k_proj', self.module.k_proj)
             self.replace_linear('v_proj', self.module.v_proj)
-            self.replace_linear('o_proj', self.module.o_proj, pre=True)
+            self.replace_linear_u('o_proj', self.module.o_proj, pre=True)
         elif isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP):
             self.module.up_proj.weight = nn.Parameter(split_tensor(self.module.up_proj.weight, self.world_size, dim=0)[self.rank])
             self.module.gate_proj.weight = nn.Parameter(split_tensor(self.module.gate_proj.weight, self.world_size, dim=0)[self.rank])
@@ -1064,7 +1064,6 @@ class RtpParallel(nn.Module):
                 self.RecursiveVisit(name, child, module)
         else:
             if isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
-                
                 module = RtpWarpper(module, self.group)
                 setattr(upper_module, name, module)
             elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):

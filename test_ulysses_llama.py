@@ -197,7 +197,7 @@ def benchmark_dp(rank, args, world_size):
         # outputs = attention(inputs)
         # output_list = split_tensor(outputs, world_size, dim=1)
         # ref = rtpattention(seq_inputs)
-        
+
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
 
         inputs.retain_grad()
@@ -261,24 +261,25 @@ def benchmark_dp(rank, args, world_size):
         #     p2[1].grad = None
             
         # rtp
-        # for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
-        #     tp_dim = None
-        #     for i, dim in enumerate(p1[1].grad.shape):
-        #         if dim != p2[1].grad.shape[i]:
-        #             tp_dim = i
-        #             break
+        for p1, p2 in zip(rtpattention.named_parameters(), attention.named_parameters()):
+            tp_dim = None
+            for i, dim in enumerate(p1[1].grad.shape):
+                if dim != p2[1].grad.shape[i]:
+                    tp_dim = i
+                    break
 
-        #     if tp_dim != None:
-        #         ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(world_size)
-        #     else:
-        #         ref = p2[1].grad
-            
-        #     # assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
-        #     if not torch.allclose(p1[1].grad, ref, rtol=1e-5, atol=1e-5):
-        #         print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}")
-        #     # print(p1[1].grad, ref)
-        #     p1[1].grad = None
-        #     p2[1].grad = None
+            if tp_dim != None:
+                ref = split_tensor(p2[1].grad, world_size, dim=tp_dim)[rank].mul_(world_size)
+            else:
+                ref = p2[1].grad
+
+            # assert torch.allclose(p1[1].grad, ref, rtol=1e-3, atol=1e-4), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}"
+            if p1[1].grad.shape == ref.shape:
+                if not torch.allclose(p1[1].grad, ref, rtol=1e-5, atol=1e-5):
+                    print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{ref}")
+            # print(p1[1].grad, ref)
+            p1[1].grad = None
+            p2[1].grad = None
 
         inputs_grad = split_tensor(inputs.grad, world_size, dim=1)[rank].mul_(world_size)
         assert torch.allclose(inputs_grad, seq_inputs.grad, atol=1e-5), f"{inputs_grad}\nvs\n{seq_inputs.grad}"
