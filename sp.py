@@ -805,6 +805,40 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         
         return grad, grad_output, None, None, None
 
+class _RotationParallelRegion_one(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(ctx, input_, module, itr, index):
+        return _left_rotation(input_)
+
+    @staticmethod
+    def forward(ctx, input_, module, itr, index):
+        
+        ctx.module = module
+        ctx.itr = itr
+        ctx.index = index
+
+        is_start = (itr == 0)
+        is_end = (itr == torch.distributed.get_world_size() - 1)
+        
+        output = rotation_all_for_one(input_, module, is_start, is_end, index, itr)
+        
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        module = ctx.module
+        itr = ctx.itr
+        index = ctx.index
+
+        is_start = (itr == torch.distributed.get_world_size() - 1)
+        is_end = (itr == 0)
+        
+        grad = rotation_one_for_all(grad_output, module, is_start, is_end, index, itr)
+        
+        return grad, None, None, None
+        
 class RtpLinearWarpper(nn.Module):
     def __init__(
         self,
@@ -857,12 +891,18 @@ class RtpLinearWarpper(nn.Module):
             inputs = args[0]
             inputs = all_to_all(inputs, self.group, scatter_dim=1, gather_dim=-1)
             bsz, q_len, _ = inputs.size()
-            outputs_buffer = torch.zeros((bsz, q_len, self.out_features), device=inputs.device, dtype=inputs.dtype)
+            outputs_buffer = None 
             for i in range(self.world_size):
-                index = (self.rank - i +self.world_size) % self.world_size
-                inputs = _RotationParallelRegion.apply(inputs, self, i, index)
-                outputs = self.module_list[index](inputs, **kwargs)
-                outputs_buffer[:, :, index*(self.out_features//self.world_size):(index+1)*(self.out_features//self.world_size)] = outputs
+                index = (self.rank + i +self.world_size) % self.world_size
+                # input_buffer = _RotationParallelRegion_one.apply(inputs, self, i, index)
+                input_buffer = inputs[:, :, self.out_features // self.world_size * index : self.out_features // self.world_size * (index + 1)]
+                input_buffer = _RotationParallelRegion.apply(input_buffer, self, i, index)
+                outputs = self.module_list[index](input_buffer, **kwargs)
+                outputs = _RotationParallelRegion_after.apply(outputs, self, i, index)
+                if outputs_buffer is None:
+                    outputs_buffer = outputs
+                else:
+                    outputs_buffer = outputs_buffer + outputs
         else:
             inputs = args[0]
 
@@ -912,9 +952,9 @@ class RtpWarpper(nn.Module):
             if self.module.v_proj.bias is not None:
                 self.module.v_proj.bias = nn.Parameter(split_tensor(self.module.v_proj.bias, self.world_size, dim=0)[self.rank])
                 
-            # self.module.o_proj.weight = nn.Parameter(split_tensor(self.module.o_proj.weight, self.world_size, dim=0)[self.rank])
-            # if self.module.o_proj.bias is not None:
-            #     self.module.o_proj.bias = nn.Parameter(split_tensor(self.module.o_proj.bias, self.world_size, dim=0)[self.rank])
+            self.module.o_proj.weight = nn.Parameter(split_tensor(self.module.o_proj.weight, self.world_size, dim=1)[self.rank])
+            if self.module.o_proj.bias is not None:
+                self.module.o_proj.bias.div_(self.world_size)
                 
             self.module.num_heads = module.num_heads // self.world_size
             self.module.num_key_value_heads = module.num_key_value_heads // self.world_size
@@ -923,7 +963,7 @@ class RtpWarpper(nn.Module):
             self.replace_linear('q_proj', self.module.q_proj)
             self.replace_linear('k_proj', self.module.k_proj)
             self.replace_linear('v_proj', self.module.v_proj)
-            self.replace_linear_u('o_proj', self.module.o_proj, pre=True)
+            self.replace_linear('o_proj', self.module.o_proj, pre=True)
 
     
     def replace_linear_u(self, name, module, pre=False, qkv=False):
