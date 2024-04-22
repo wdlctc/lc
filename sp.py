@@ -670,7 +670,7 @@ def rotation_grad(param, module, is_start, is_end, left_or_right, index):
 def rotation_one_for_all(one, all_, module, is_start, is_end, index, itr):
     # init grad and buffer
     
-    bsz, q_len, _ = one_.size()
+    bsz, q_len, _ = one.size()
     
     if is_start:
         all_[:, q_len*index:q_len*(index + 1), :] = one
@@ -684,18 +684,27 @@ def rotation_one_for_all(one, all_, module, is_start, is_end, index, itr):
 
     return all_
  
-def rotation_all_for_one(one, all_, module, is_start, is_end, index, itr):
+def rotation_all_for_one(all_, module, is_start, is_end, index, itr):
     # init grad and buffer
     
-    bsz, q_len, _ = one_.size()
+    group = torch.distributed.distributed_c10d._get_default_group()
+    rank = torch.distributed.get_rank(group)
+    world_size = torch.distributed.get_world_size(group)
+    
+    bsz, q_len, _ = all_.size()
+    q_len = q_len // world_size
     
     if is_start:
         module.one_for_all_reqs = [None for _ in range(world_size)]
-        for i in range(torch.distributed.get_world_size()):
-            module.one_for_all_reqs[i] = _left_rotation(all_[:, q_len*index:q_len*(index + 1), :], all_[:, q_len*index:q_len*(index + 1), :], itr)
+        buffer_all = all_.clone().detach()
+        for i in range(world_size):
+            index = (i + rank) % world_size
+            module.one_for_all_reqs[i] = _left_rotation(buffer_all[:, q_len*index:q_len*(index + 1), :], all_[:, q_len*index:q_len*(index + 1), :], i)
 
     for req in module.one_for_all_reqs[itr]:
         req.wait()
+    if is_end:
+        buffer_all = None
 
     return all_[:, q_len*index:q_len*(index + 1), :]
 
@@ -789,14 +798,10 @@ class _RotationParallelRegion_all(torch.autograd.Function):
         itr = ctx.itr
         index = ctx.index
 
-        group = torch.distributed.distributed_c10d._get_default_group()
-        rank = torch.distributed.get_rank(group)
-        world_size = torch.distributed.get_world_size(group)
-
         is_start = (itr == torch.distributed.get_world_size() - 1)
         is_end = (itr == 0)
         
-        grad = rotation_all_for_one(input_, buffer, module, is_start, is_end, index, itr)
+        grad = rotation_all_for_one(grad_output, module, is_start, is_end, index, itr)
         
         return grad, grad_output, None, None, None
 
@@ -862,16 +867,16 @@ class RtpLinearWarpper(nn.Module):
             inputs = args[0]
 
             bsz, q_len, _ = inputs.size()
-            # outputs_buffer = torch.zeros((bsz, q_len * self.world_size, self.out_features // self.world_size), device=inputs.device, dtype=inputs.dtype)
-            outputs_buffer = torch.zeros((bsz, q_len, self.out_features), device=inputs.device, dtype=inputs.dtype)
+            outputs_buffer = torch.zeros((bsz, q_len * self.world_size, self.out_features // self.world_size), device=inputs.device, dtype=inputs.dtype)
+            # outputs_buffer = torch.zeros((bsz, q_len, self.out_features), device=inputs.device, dtype=inputs.dtype)
             for i in range(self.world_size):
                 index = (self.rank + i +self.world_size) % self.world_size
                 inputs = _RotationParallelRegion.apply(inputs, self, i, index)
                 outputs = self.module_list[index](inputs, **kwargs)
                 outputs = _RotationParallelRegion_after.apply(outputs, self, i, index)
-                outputs_buffer[:, :, (self.out_features // self.world_size) * index:(self.out_features // self.world_size) * (index + 1)] = outputs
-                # outputs_buffer = _RotationParallelRegion_all.apply(outputs, outputs_buffer, self, i, index)
-            outputs_buffer = all_to_all(outputs_buffer, self.group, scatter_dim=-1, gather_dim=1)
+                # outputs_buffer[:, :, (self.out_features // self.world_size) * index:(self.out_features // self.world_size) * (index + 1)] = outputs
+                outputs_buffer = _RotationParallelRegion_all.apply(outputs, outputs_buffer, self, i, index)
+            # outputs_buffer = all_to_all(outputs_buffer, self.group, scatter_dim=-1, gather_dim=1)
         return outputs_buffer
 
 
