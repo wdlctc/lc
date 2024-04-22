@@ -114,18 +114,20 @@ def benchmark_dp(rank, args, world_size):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention)
+        is_MultiheadAttention = isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP)
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 m = RecursiveVisit(name, child, module)
-                if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(m, transformers.models.llama.modeling_llama.LlamaAttention):
+                # if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(m, transformers.models.llama.modeling_llama.LlamaAttention):
+                #     return m
+                if isinstance(m, transformers.models.llama.modeling_llama.LlamaMLP):
                     return m
+        
         else:
             return module
             
     attention = RecursiveVisit('name', model, model)
-    attention.training = True
 
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -183,16 +185,19 @@ def benchmark_dp(rank, args, world_size):
         seq_inputs.requires_grad = True
         seq_inputs.retain_grad()
         
-        outputs = attention(hidden_states=inputs, position_ids=position_ids)
+        # outputs = attention(hidden_states=inputs, position_ids=position_ids)
 
-        output_list = split_tensor(outputs[0], world_size, dim=1)
+        # output_list = split_tensor(outputs[0], world_size, dim=1)
         # ref = orisqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = tpsqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = ulyssattention(seq_inputs, position_ids=position_ids)[0]
-        ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
+        # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
         # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
 
-        # print(output_list[rank], ref)
+        outputs = attention(inputs)
+        output_list = split_tensor(outputs, world_size, dim=1)
+        ref = rtpattention(seq_inputs)
+        
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
 
         inputs.retain_grad()
