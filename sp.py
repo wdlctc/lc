@@ -845,7 +845,8 @@ class RtpLinearWarpper(nn.Module):
         module: nn.Module,
         group: Optional[Any] = None,
         pre = False,
-        qkv = False
+        qkv = False,
+        add = True,
     ):
         super().__init__()
         self.module = module
@@ -853,6 +854,7 @@ class RtpLinearWarpper(nn.Module):
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.pre = pre
+        self.add = add
 
         param_list = list(module.parameters())
 
@@ -887,7 +889,8 @@ class RtpLinearWarpper(nn.Module):
 
         inputs = args[0]
 
-        bsz, q_len, out_features = inputs.size()
+        bsz, q_len, _ = inputs.size()
+        out_features = self.module.out_features
         outputs_buffer = torch.zeros((bsz, q_len * self.world_size, out_features // self.world_size), device=inputs.device, dtype=inputs.dtype)
         for i in range(self.world_size):
             index = (self.rank + i +self.world_size) % self.world_size
@@ -919,12 +922,12 @@ class RtpLinearWarpper(nn.Module):
         if self.pre and isinstance(self.module, nn.Linear):
             inputs = args[0]
             inputs = all_to_all(inputs, self.group, scatter_dim=1, gather_dim=-1)
-            bsz, q_len, _ = inputs.size()
+            bsz, q_len, out_features = inputs.size()
             outputs_buffer = None 
             for i in range(self.world_size):
                 index = (self.rank + i +self.world_size) % self.world_size
                 # input_buffer = _RotationParallelRegion_one.apply(inputs, self, i, index)
-                input_buffer = inputs[:, :, self.out_features // self.world_size * index : self.out_features // self.world_size * (index + 1)]
+                input_buffer = inputs[:, :, out_features // self.world_size * index : out_features // self.world_size * (index + 1)]
                 input_buffer = _RotationParallelRegion.apply(input_buffer, self, i, index)
                 outputs = self.module_list[index](input_buffer, **kwargs)
                 outputs = _RotationParallelRegion_after.apply(outputs, self, i, index)
@@ -992,7 +995,24 @@ class RtpWarpper(nn.Module):
             self.module.down_proj.weight = nn.Parameter(split_tensor(self.module.down_proj.weight, self.world_size, dim=1)[self.rank])
 
             self.replace_MLP(self.module)
+        # elif isinstance(module, nn.Linear):
+        #     if self.module.out_features % self.world_size == 0:
+        #         self.module.weight = nn.Parameter(split_tensor(self.module.weight, self.world_size, dim=0)[self.rank])
+        #         self.module.bias is not None:
+        #             self.module.bias = nn.Parameter(split_tensor(self.module.bias, self.world_size, dim=0)[self.rank])
+                
+        #         self.replace_linear(self.module)
+        #     elif self.module.in_features % self.world_size == 0:
+        #         self.module.weight = nn.Parameter(split_tensor(self.module.weight, self.world_size, dim=-1)[self.rank])
+        #         if self.module.bias is not None:
+        #             self.module.bias.data.div_(self.world_size)
+
+        #         self.replace_linear(self.module, add = False)
     
+    def replace_linear(self, module, add):
+        module = RtpLinearWarpper(module, self.group, add=add)
+        self.module = module
+        
     def replace_MLP(self, module):
         module = RtpLinearWarpper(module, self.group)
         self.module = module
@@ -1047,13 +1067,19 @@ class RtpParallel(nn.Module):
                 
                 module = RtpWarpper(module, self.group)
                 setattr(upper_module, name, module)
-            if isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
+            elif isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention):
                 module = RtpWarpper(module, self.group)
                 setattr(upper_module, name, module)
-                
             elif isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP):
                 module = RtpWarpper(module, self.group)
                 setattr(upper_module, name, module)
+            else:
+                module = FullyShardedDataParallel(module, self.group)
+                setattr(upper_module, name, module)
+                
+            # elif isinstance(module, nn.Linear):
+            #     module = RtpWarpper(module, self.group)
+            #     setattr(upper_module, name, module)
                 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         outputs = self.module(*args, **kwargs)

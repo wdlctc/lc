@@ -119,10 +119,10 @@ def benchmark_dp(rank, args, world_size):
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 m = RecursiveVisit(name, child, module)
-                # if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(m, transformers.models.llama.modeling_llama.LlamaAttention):
-                #     return m
-                if isinstance(m, transformers.models.llama.modeling_llama.LlamaMLP):
+                if isinstance(m, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(m, transformers.models.llama.modeling_llama.LlamaAttention):
                     return m
+                # if isinstance(m, transformers.models.llama.modeling_llama.LlamaMLP):
+                #     return m
         
         else:
             return module
@@ -185,18 +185,18 @@ def benchmark_dp(rank, args, world_size):
         seq_inputs.requires_grad = True
         seq_inputs.retain_grad()
         
-        # outputs = attention(hidden_states=inputs, position_ids=position_ids)
+        outputs = attention(hidden_states=inputs, position_ids=position_ids)
 
-        # output_list = split_tensor(outputs[0], world_size, dim=1)
+        output_list = split_tensor(outputs[0], world_size, dim=1)
         # ref = orisqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = tpsqattention(seq_inputs, position_ids=position_ids)[0]
         # ref = ulyssattention(seq_inputs, position_ids=position_ids)[0]
-        # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
+        ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
         # ref = rtpattention(seq_inputs, position_ids=position_ids)[0]
 
-        outputs = attention(inputs)
-        output_list = split_tensor(outputs, world_size, dim=1)
-        ref = rtpattention(seq_inputs)
+        # outputs = attention(inputs)
+        # output_list = split_tensor(outputs, world_size, dim=1)
+        # ref = rtpattention(seq_inputs)
         
         assert torch.allclose(output_list[rank], ref, atol=1e-3), f"{torch.max((output_list[rank] - ref))}"
 
