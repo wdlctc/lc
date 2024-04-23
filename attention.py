@@ -23,6 +23,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+
 from rtp.rotated_tensor_parallel import RotatedTensorParallel
 
 import copy
@@ -86,47 +88,68 @@ def benchmark_dp(rank, args, world_size):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention) 
+        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention)
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 m = RecursiveVisit(name, child, module)
-                if isinstance(m, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoSelfAttention):
+                if isinstance(m, transformers.models.llama.modeling_llama.LlamaAttention):
                     return m
         else:
             return module
 
     attention = RecursiveVisit('name', model, model)
+    attention.training = True
     attention = copy.deepcopy(attention)
-    ddp_attention = copy.deepcopy(attention)
-    fsdp_attention = copy.deepcopy(attention)
-    rtp_attention = copy.deepcopy(attention)
+    attention2 = copy.deepcopy(attention)
 
     del model
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
-    ddp_attention = DDP(ddp_attention.to(device))
-    fsdp_attention = FullyShardedDataParallel(fsdp_attention.to(device))
-    rtp_attention = RotatedTensorParallel(rtp_attention.to(device))
+    attention2.to(device)
     # rtp_attention.eval()
     
-    print(attention, rtp_attention)
-    print(attention.attn_dropout, attention.resid_dropout)
+    print(attention, attention2)
     
-    num_epochs = 3
-    init_random_seed(0)
+    position_ids = torch.arange(
+        0, args.max_length, device=device
+    ).unsqueeze(0)
+    
+    temp_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0)
+    full_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).cuda().unsqueeze(0)
+
+    num_epochs = 1
     for epoch in range(num_epochs):
+        init_random_seed(epoch)
         start_time = time.time()
-        batch = torch.randn(args.batch_size, args.max_length, attention.embed_dim, dtype=torch.float16).cuda()
+        batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size).cuda()
         inputs = batch.to(device)
-        outputs = attention(hidden_states=inputs, output_attentions=True)
+        seqinputs = inputs.clone().detach()
+        outputs = attention(hidden_states=inputs, position_ids=position_ids)
+
+        past = DynamicCache()
+
+        outputs[0].backward(outputs[0])
         # DDP_outputs = ddp_attention(hidden_states=inputs, output_attentions=True)
         # fsdp_outputs = fsdp_attention(hidden_states=inputs, output_attentions=True)
-        rtp_outputs = rtp_attention(hidden_states=inputs, output_attentions=True)
+        
+        for i in range(2):
+            outputs2 = attention2(hidden_states=seqinputs[:, i*(args.max_length//2): (i+1)*(args.max_length//2), :], position_ids=position_ids[:, i*(args.max_length//2): (i+1)*(args.max_length//2)], use_cache=True, past_key_value=past, attention_mask=temp_mask)
+            temp_mask = torch.cat((full_mask, temp_mask), dim=-1)
+            outputs2[0].backward(outputs2[0], retain_graph=True)
 
-        assert torch.allclose(outputs[0], rtp_outputs[0], atol=1e-3), f"{torch.max((outputs[0] - rtp_outputs[0]))}"
+        for p1, p2 in zip(attention.named_parameters(), attention2.named_parameters()):
+            # print(p1[0], p1[1].grad.shape, p2[1].grad.shape, torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4))
+            # print(p1[0], p1[1].grad[0] , p2[1].grad[0])
+            # p1[1].grad = p1[1].grad * 2
+            if not torch.allclose(p1[1].grad, p2[1].grad, atol=1e-4):
+                print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}")
+            # print(p1[0], p1[1].grad*2, p2[1].grad)
+            p1[1].grad = None
+            p2[1].grad = None
+        # assert torch.allclose(outputs[0], outputs2[0], atol=1e-3), f"{torch.max((outputs[0] - outputs2[0]))}"
 
 
         epoch_time = time.time() - start_time
@@ -142,7 +165,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="EleutherAI/gpt-neo-125m"
+        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -154,7 +177,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=5
+        "--max_length", type=int, default=4
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
