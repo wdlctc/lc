@@ -117,14 +117,14 @@ def benchmark_dp(rank, args, world_size):
         0, args.max_length, device=device
     ).unsqueeze(0)
     
-    temp_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0)
-    full_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).cuda().unsqueeze(0)
+    temp_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0).unsqueeze(0)
+    full_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).cuda().unsqueeze(0).unsqueeze(0)
 
     num_epochs = 1
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
-        batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size).cuda()
+        batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda()
         inputs = batch.to(device)
         seqinputs = inputs.clone().detach()
         outputs = attention(hidden_states=inputs, position_ids=position_ids)
@@ -144,7 +144,7 @@ def benchmark_dp(rank, args, world_size):
             # print(p1[0], p1[1].grad.shape, p2[1].grad.shape, torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4))
             # print(p1[0], p1[1].grad[0] , p2[1].grad[0])
             # p1[1].grad = p1[1].grad * 2
-            if not torch.allclose(p1[1].grad, p2[1].grad, atol=1e-4):
+            if not torch.allclose(p1[1].grad, p2[1].grad, atol=1e-2):
                 print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}")
             # print(p1[0], p1[1].grad*2, p2[1].grad)
             p1[1].grad = None
