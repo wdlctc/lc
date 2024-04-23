@@ -56,20 +56,65 @@ def main(args):
     # Set up the optimizer
     # Training loop
     num_epochs = 3
+    mini_sequence = 4
+
+    position_ids_list = []
+    sub_length = args.max_length // mini_sequence
+    for i in range(mini_sequence):
+        position_ids_list.append(torch.arange(
+            sub_length * i, sub_length * (i+1), device=device
+        ).unsqueeze(0))
+
+    mask_list = []
     
+    temp_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0).unsqueeze(0)
+    full_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).cuda().unsqueeze(0).unsqueeze(0)
+    all_mask = temp_mask
+    
+    for i in range(mini_sequence):
+        mask_list.append(all_mask)
+        all_mask = torch.cat((full_mask, all_mask), dim=-1)
+
     for epoch in range(num_epochs):
         start_time = time.time()
-        model.train()
         total_loss = 0
     
         for batch in data_loader:
             inputs = batch.to(device)
 
-            outputs = model(input_ids=inputs, labels=inputs)
-            loss = outputs.loss
-            loss.backward()
-            total_loss += loss.item()
+            inputs_list = []
+            label_list = []
 
+            for i in range(mini_sequence):
+                inputs_list.append(inputs[:, i*(sub_length): (i+1)*(sub_length)])
+
+            for i in range(mini_sequence):
+                if i != mini_sequence - 1:
+                    label_list.append(inputs[:, 1 + i*(sub_length): 1 + (i+1)*(sub_length)])
+                else:
+                    label_list.append(inputs[:, 1 + i*(sub_length): (i+1)*(sub_length)])
+                    label_list[i].end = True
+                label_list[i].mini = True
+
+            past_key_values = None
+            for i in range(mini_sequence):
+                if past_key_values is not None:
+                    past_key_values = list(past_key_values)
+                    for layer_idx in range(len(past_key_values)):
+                        key_states, value_states = past_key_values[layer_idx]
+                        past_key_values[layer_idx] = (key_states.detach(), value_states.detach())
+                    past_key_values = tuple(past_key_values)
+
+                
+                outputs = model(input_ids=inputs_list[i], labels=label_list[i], position_ids=position_ids_list[i], attention_mask = mask_list[i], use_cache=True, past_key_values=past_key_values)
+                loss = outputs.loss
+                past_key_values = outputs.past_key_values
+                loss.backward()
+                
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+    
         avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
@@ -97,7 +142,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=1024
+        "--max_length", type=int, default=16
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
