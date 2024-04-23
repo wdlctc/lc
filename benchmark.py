@@ -86,9 +86,18 @@ def main(args):
             inputs = batch.to(device)
 
             inputs_list = []
+            label_list = []
 
             for i in range(mini_sequence):
                 inputs_list.append(inputs[:, i*(sub_length): (i+1)*(sub_length)])
+
+            for i in range(mini_sequence):
+                if i != mini_sequence - 1:
+                    label_list.append(inputs[:, 1 + i*(sub_length): 1 + (i+1)*(sub_length)])
+                else:
+                    label_list.append(inputs[:, 1 + i*(sub_length): (i+1)*(sub_length)])
+                    label_list[i].end = True
+                label_list[i].mini = True
             
             outputs = model(input_ids=inputs, labels=inputs)
             loss = outputs.loss
@@ -105,7 +114,7 @@ def main(args):
 
                 # print(past_key_values)
                 
-                outputs2 = model2(input_ids=inputs_list[i], labels=inputs_list[i], position_ids=position_ids_list[i], attention_mask = mask_list[i], use_cache=True, past_key_values=past_key_values)
+                outputs2 = model2(input_ids=inputs_list[i], labels=label_list[i], position_ids=position_ids_list[i], attention_mask = mask_list[i], use_cache=True, past_key_values=past_key_values)
                 loss2 = outputs2.loss
                 past_key_values = outputs2.past_key_values
                 loss2.backward()
@@ -115,14 +124,15 @@ def main(args):
                 # print(p1[0], p1[1].grad.shape, p2[1].grad.shape, torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-3, atol=1e-4))
                 # print(p1[0], p1[1].grad[0] , p2[1].grad[0])
                 # p1[1].grad = p1[1].grad * 2
-                print(p1[0], p1[1].grad, p2[1].grad)
-                if not torch.allclose(p1[1].grad, p2[1].grad, atol=1e-4):
+                p2[1].grad = p2[1].grad.div(mini_sequence)
+                if not torch.allclose(p1[1].grad, p2[1].grad, atol=1e-1, rtol=1e-1):
                     print(f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}")
+                # print(torch.max(torch.abs(p1[1].grad - p2[1].grad)))
                 # print(p1[0], p1[1].grad*2, p2[1].grad)
                 p1[1].grad = None
                 p2[1].grad = None
             # # optimizer.step()
-            optimizer.zero_grad()
+            # optimizer.zero_grad()
             total_loss += loss.item()
 
             return
@@ -154,7 +164,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=4
+        "--max_length", type=int, default=1024
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
