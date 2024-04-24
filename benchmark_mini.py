@@ -67,13 +67,15 @@ def main(args):
 
     mask_list = []
     
-    temp_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0).unsqueeze(0)
-    full_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).cuda().unsqueeze(0).unsqueeze(0)
-    all_mask = temp_mask
+    # temp_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0).unsqueeze(0)
+    # full_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).cuda().unsqueeze(0).unsqueeze(0)
+    # all_mask = temp_mask
     
     for i in range(mini_sequence):
-        mask_list.append(all_mask)
-        all_mask = torch.cat((full_mask, all_mask), dim=-1)
+        mask_list.append(None)
+        
+    #     mask_list.append(all_mask)
+    #     all_mask = torch.cat((full_mask, all_mask), dim=-1)
 
     for epoch in range(num_epochs):
         start_time = time.time()
@@ -105,7 +107,6 @@ def main(args):
                         past_key_values[layer_idx] = (key_states.detach(), value_states.detach())
                     past_key_values = tuple(past_key_values)
 
-                
                 outputs = model(input_ids=inputs_list[i], labels=label_list[i], position_ids=position_ids_list[i], attention_mask = mask_list[i], use_cache=True, past_key_values=past_key_values)
                 loss = outputs.loss
                 past_key_values = outputs.past_key_values
@@ -142,7 +143,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=16
+        "--max_length", type=int, default=512
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
