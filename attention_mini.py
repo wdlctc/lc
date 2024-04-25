@@ -100,7 +100,7 @@ def benchmark_dp(rank, args, world_size):
 
     attention = RecursiveVisit('name', model, model)
     attention.training = True
-
+    
     del model
     
     # Move the model to GPU(s)
@@ -111,19 +111,33 @@ def benchmark_dp(rank, args, world_size):
         0, args.max_length, device=device
     ).unsqueeze(0)
     
+    # temp_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0).unsqueeze(0)
+    # full_mask = torch.ones(args.max_length // 2, args.max_length // 2, dtype=torch.bool).cuda().unsqueeze(0).unsqueeze(0)
+
+    temp_mask = None
+
+    mini = 4
+
     num_epochs = 3
     batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda()
-    inputs = batch.to(device)
+    seqinputs = batch.to(device)
     torch.cuda.synchronize()
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
-        outputs = attention(hidden_states=inputs, position_ids=position_ids)
+        # seqinputs = inputs.clone().detach()
 
+        past = DynamicCache()
 
-        outputs[0].backward(outputs[0])
+        
+        for i in range(mini):
+            for j in range(len(past)):
+                past.key_cache[j] = past.key_cache[j].detach()
+                past.value_cache[j] = past.value_cache[j].detach()
+            outputs = attention(hidden_states=seqinputs[:, i*(args.max_length//mini): (i+1)*(args.max_length//mini), :], position_ids=position_ids[:, i*(args.max_length//mini): (i+1)*(args.max_length//mini)], use_cache=True, past_key_value=past, attention_mask=temp_mask)
+            outputs[0].backward(outputs[0])
+
         torch.cuda.synchronize()
-
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Time: {epoch_time:.2f} seconds")
 
