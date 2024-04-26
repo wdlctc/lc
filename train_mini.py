@@ -157,6 +157,34 @@ def main(args):
 
     step = 0
     num_epochs = 3
+
+    def get_mini_sequence_list(max_length, mini_sequence):
+        
+        position_ids_list = []
+        sub_length = args.max_length // mini_sequence
+        for i in range(mini_sequence):
+            position_ids_list.append(torch.arange(
+                sub_length * i, sub_length * (i+1), device=device
+            ).unsqueeze(0))
+
+        
+        mask_list = []
+        
+        temp_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).tril(diagonal=0).cuda().unsqueeze(0).unsqueeze(0).expand(args.batch_size, 1, sub_length, sub_length)
+        full_mask = torch.ones(sub_length, sub_length, dtype=torch.bool).cuda().unsqueeze(0).unsqueeze(0).expand(args.batch_size, 1, sub_length, sub_length)
+        all_mask = temp_mask
+
+    
+        for i in range(mini_sequence):
+            mask_list.append(all_mask)
+            all_mask = torch.cat((full_mask, all_mask), dim=-1)
+
+        return position_ids_list, mask_list
+        
+    mini_sequence = 4
+    position_ids_list, mask_list = get_mini_sequence_list(args.max_length, mini_sequence)
+    sub_length = args.max_length // mini_sequence
+    
     update_time = time.time()
     for epoch in range(num_epochs):
         model.train()
@@ -165,12 +193,38 @@ def main(args):
             step += 1
             
             batch = {k: v.to(device) for k, v in batch.items()}
+            inputs = batch["input_ids"]
             labels = batch["input_ids"].clone()
             labels[labels == pad_idx] = -100
 
-            outputs = model(**batch, labels=labels)
-            loss = outputs.loss
-            loss.backward()
+            inputs_list = []
+            label_list = []
+            attention_mask_list = []
+
+            for i in range(mini_sequence):
+                inputs_list.append(inputs[:, i*(sub_length): (i+1)*(sub_length)])
+
+            for i in range(mini_sequence):
+                if i != mini_sequence - 1:
+                    label_list.append(labels[:, 1 + i*(sub_length): 1 + (i+1)*(sub_length)])
+                else:
+                    label_list.append(labels[:, 1 + i*(sub_length): (i+1)*(sub_length)])
+                    label_list[i].end = True
+                label_list[i].mini = True
+
+            
+            for i in range(mini_sequence):
+                inputs_list.append(inputs[:, i*(sub_length): (i+1)*(sub_length)])
+    
+            for i in range(mini_sequence):
+                attention_mask_list.append(batch["attention_mask"][:, : (i+1)*(sub_length)])
+                
+            past_key_values = None
+            for i in range(mini_sequence):
+                outputs = model(input_ids=inputs_list[i], labels=label_list[i], position_ids=position_ids_list[i], attention_mask = attention_mask_list[i], use_cache=True, past_key_values=past_key_values)
+                loss = outputs.loss
+                loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1/mini_sequence)
             optimizer.step()
             optimizer.zero_grad()
 
