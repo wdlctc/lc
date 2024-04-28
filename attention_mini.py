@@ -25,8 +25,8 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+# from flash_attn import flash_attn_func, flash_attn_varlen_func
+# from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 from rtp.rotated_tensor_parallel import RotatedTensorParallel
 
@@ -192,8 +192,8 @@ class LlamaSdpaAttention(nn.Module):
 
         causal_mask = attention_mask
         # if attention_mask is not None and cache_position is not None:
-        if attention_mask is not None:
-            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+        # if attention_mask is not None:
+        #     causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -253,7 +253,14 @@ class LlamaSdpaAttention(nn.Module):
             for i in range(self.mini):
                 hidden_states_mini = hidden_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :]
                 if attention_mask is None:
-                    attention_mask_mini = None
+                    L = (q_len//self.mini)
+                    S = (q_len//self.mini)*(i+1)
+                    attention_mask_mini = torch.ones(L, S, dtype=torch.bool, device=hidden_states.device).tril(diagonal=(q_len//self.mini)*i)
+                    attn_bias = torch.zeros(L, S, dtype=hidden_states.dtype, device=hidden_states.device)
+                    attn_bias.masked_fill_(attention_mask_mini.logical_not(), float("-inf"))
+                    attn_bias.to(hidden_states.dtype)
+                    attention_mask_mini = attn_bias
+                    print(attention_mask_mini)
                 else:
                     attention_mask_mini = attention_mask[:,:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :(i+1)*(q_len//self.mini)]
                 position_ids_mini = position_ids[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini)]
@@ -625,7 +632,7 @@ def benchmark_dp(rank, args, world_size):
     attention_mask = attention_mask.triu(diagonal=1)
     attention_mask = attention_mask[None, None, :, :].expand(batch.shape[0], 1, -1, -1)
 
-    print(attention_mask)
+    # print(attention_mask)
     
     torch.cuda.synchronize()
     for epoch in range(num_epochs):

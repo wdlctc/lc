@@ -130,8 +130,6 @@ def main(args):
             loss.backward()
             total_loss += loss.item()
 
-            return
-
         avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
