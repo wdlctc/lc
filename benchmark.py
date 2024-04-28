@@ -118,8 +118,6 @@ def main(args):
         total_loss = 0
     
         for batch in dataloader:
-
-            print(batch)
             
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["input_ids"].clone()

@@ -175,7 +175,6 @@ def main(args):
             optimizer.zero_grad()
 
             print(loss)
-            return
             if step == 100:
                 return
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
