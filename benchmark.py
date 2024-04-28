@@ -17,12 +17,58 @@ from transformers import TrainingArguments, TextDataset, DataCollatorForLanguage
 import numpy as np
 import copy
 
+from torch.utils.data import IterableDataset, DataLoader
+class PreprocessedIterableDataset(IterableDataset):
+    def __init__(self, data, tokenizer, batch_size, max_length):
+        super().__init__()
+        self.data = data
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.max_length = max_length
+
+    def __iter__(self):
+        worker_info = None
+        if worker_info is None:
+            # If no worker_info is provided, we are not using DataLoader workers, so yield all data
+            iter_data = iter(self.data)
+        else:
+            # If using DataLoader workers, yield a subset of the data for this worker
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            iter_data = itertools.islice(self.data, worker_id, None, num_workers)
+
+        batch = []
+        for example in iter_data:
+            tokenized_example = self.tokenizer(
+                example["text"],
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            batch.append(tokenized_example)
+
+            if len(batch) == self.batch_size:
+                yield self._format_batch(batch)
+                batch = []
+
+        if batch:
+            yield self._format_batch(batch)
+
+    def _format_batch(self, batch):
+        input_ids = torch.stack([item["input_ids"].squeeze(0) for item in batch])
+        attention_mask = torch.stack([item["attention_mask"].squeeze(0) for item in batch])
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
 def main(args):
     # Specify the pretrained model name or path
     model_name = args.model_name
     
     # Load the tokenizer and pretrained model
     model, tokenizer = load(model_name)
+    
+    pad_idx = tokenizer.pad_token_id
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,24 +97,40 @@ def main(args):
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
     
     # DataLoader
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    # data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    from datasets import load_dataset, load_from_disk
+    dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
+    dataset = PreprocessedIterableDataset(dataset, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
     
     # Set up the optimizer
     # Training loop
     num_epochs = 3
+    
+    position_ids = torch.arange(
+        0, args.max_length, device=device
+    ).unsqueeze(0)
     
     for epoch in range(num_epochs):
         start_time = time.time()
         model.train()
         total_loss = 0
     
-        for batch in data_loader:
-            inputs = batch.to(device)
+        for batch in dataloader:
 
-            outputs = model(input_ids=inputs, labels=inputs)
+            print(batch)
+            
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch["input_ids"].clone()
+            labels[labels == pad_idx] = -100
+
+            outputs = model(**batch, labels=labels)
             loss = outputs.loss
             loss.backward()
             total_loss += loss.item()
+
+            return
 
         avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time
@@ -85,7 +147,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"

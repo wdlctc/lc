@@ -111,17 +111,27 @@ def benchmark_dp(rank, args, world_size):
         0, args.max_length, device=device
     ).unsqueeze(0)
     
-    num_epochs = 3
+    num_epochs = 5
     batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda()
     inputs = batch.to(device)
+    
+    dtype, device = inputs.dtype, inputs.device
+    min_dtype = torch.finfo(dtype).min
+    
+    attention_mask = torch.full((args.max_length, args.max_length), fill_value=min_dtype, dtype=dtype, device=device)
+    attention_mask = attention_mask.triu(diagonal=1)
+    attention_mask = attention_mask[None, None, :, :].expand(inputs.shape[0], 1, -1, -1)
+
+    print(attention_mask)
+    
     torch.cuda.synchronize()
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
-        outputs = attention(hidden_states=inputs, position_ids=position_ids)
+        outputs = attention(hidden_states=inputs, position_ids=position_ids, attention_mask=attention_mask)
 
 
-        outputs[0].backward(outputs[0])
+        # outputs[0].backward(outputs[0])
         torch.cuda.synchronize()
 
         epoch_time = time.time() - start_time
@@ -137,7 +147,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
