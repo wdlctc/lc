@@ -36,9 +36,6 @@ from typing import List, Optional, Tuple, Union
 
 RPC_PORT = 29501
 
-
-from torch.utils.checkpoint import checkpoint
-
 def init_random_seed(seed: int):
 
     torch.manual_seed(seed)
@@ -195,8 +192,8 @@ class LlamaSdpaAttention(nn.Module):
 
         causal_mask = attention_mask
         # if attention_mask is not None and cache_position is not None:
-        # if attention_mask is not None:
-        #     causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -213,14 +210,13 @@ class LlamaSdpaAttention(nn.Module):
             value_states,
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=self.is_causal#causal_mask is None and q_len > 1,
+            is_causal=causal_mask is None and q_len > 1,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
-        # attn_output = self.o_proj(attn_output)
-        attn_output = checkpoint(self.o_proj, attn_output)
+        attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
         
@@ -257,13 +253,7 @@ class LlamaSdpaAttention(nn.Module):
             for i in range(self.mini):
                 hidden_states_mini = hidden_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :]
                 if attention_mask is None:
-                    L = (q_len//self.mini)
-                    S = (q_len//self.mini)*(i+1)
-                    attention_mask_mini = torch.ones(L, S, dtype=torch.bool, device=hidden_states.device).tril(diagonal=(q_len//self.mini)*i)
-                    attn_bias = torch.zeros(L, S, dtype=hidden_states.dtype, device=hidden_states.device)
-                    attn_bias.masked_fill_(attention_mask_mini.logical_not(), float("-inf"))
-                    attn_bias.to(hidden_states.dtype)
-                    attention_mask_mini = attn_bias
+                    attention_mask_mini = None
                 else:
                     attention_mask_mini = attention_mask[:,:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :(i+1)*(q_len//self.mini)]
                 position_ids_mini = position_ids[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini)]
@@ -355,7 +345,52 @@ class LlamaFlashAttention2(nn.Module):
                 cache_position=cache_position,
             )
 
-        
+        if self.mini > 1:
+            bsz, q_len, _ = hidden_states.size()
+            attn_output_list = []
+            for i in range(self.mini):
+                hidden_states_mini = hidden_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :]
+                if attention_mask is None:
+                    attention_mask_mini = None
+                else:
+                    attention_mask_mini = attention_mask[:,:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :(i+1)*(q_len//self.mini)]
+                position_ids_mini = position_ids[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini)]
+
+                attn_output, attn_weights, past_key_value = self.mini_forward(
+                    hidden_states=hidden_states_mini,
+                    attention_mask=attention_mask_mini,
+                    position_ids=position_ids_mini,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                )
+                attn_output_list.append(attn_output)
+            attn_output = torch.cat(attn_output_list, dim=1).contiguous()
+            return attn_output, attn_weights, past_key_value
+        else:
+            return self.mini_forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+    def mini_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        output_attentions = False
+
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -413,29 +448,9 @@ class LlamaFlashAttention2(nn.Module):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        if self.mini > 1:
-            bsz, q_len, _ = hidden_states.size()
-            attn_output_list = []
-            for i in range(self.mini):
-
-                q = query_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :, :]
-
-
-                k = key_states[:, : (i+1)*(q_len//self.mini),  :,  :]
-                v = value_states[:, : (i+1)*(q_len//self.mini), :,  :]
-                
-                attn_output = self._flash_attention_forward(
-                    q, k, v, None, q_len//self.mini, dropout=dropout_rate
-                )
-
-                attn_output_list.append(attn_output)
-                
-            attn_output = torch.cat(attn_output_list, dim=1).contiguous()
-        else:
-            attn_output = self._flash_attention_forward(
-                query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
-            )
-                        
+        attn_output = self._flash_attention_forward(
+            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -589,27 +604,30 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
-
+    
+    attention2 = copy.deepcopy(attention)
+    
     if isinstance(attention, transformers.models.llama.modeling_llama.LlamaSdpaAttention):
         attention = LlamaSdpaAttention(attention)
     elif isinstance(attention, transformers.models.llama.modeling_llama.LlamaFlashAttention2):
         attention = LlamaFlashAttention2(attention)
+    print(attention)
     
     position_ids = torch.arange(
         0, args.max_length, device=device
     ).unsqueeze(0)
 
     num_epochs = 5
-    batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda()
+    batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda().div_(10)
     
-    # dtype, device = batch.dtype, batch.device
-    # min_dtype = torch.finfo(dtype).min
+    dtype, device = batch.dtype, batch.device
+    min_dtype = torch.finfo(dtype).min
     
-    # attention_mask = torch.full((args.max_length, args.max_length), fill_value=min_dtype, dtype=dtype, device=device)
-    # attention_mask = attention_mask.triu(diagonal=1)
-    # attention_mask = attention_mask[None, None, :, :].expand(batch.shape[0], 1, -1, -1)
+    attention_mask = torch.full((args.max_length, args.max_length), fill_value=min_dtype, dtype=dtype, device=device)
+    attention_mask = attention_mask.triu(diagonal=1)
+    attention_mask = attention_mask[None, None, :, :].expand(batch.shape[0], 1, -1, -1)
 
-    # print(attention_mask)
+    print(attention_mask)
     
     torch.cuda.synchronize()
     for epoch in range(num_epochs):
@@ -617,9 +635,21 @@ def benchmark_dp(rank, args, world_size):
         start_time = time.time()
         # seqinputs = inputs.clone().detach()
 
+        ref =  attention2(hidden_states=batch, position_ids=position_ids, attention_mask=attention_mask)
+        ref[0].backward(ref[0])
+
         past_key_value = DynamicCache()
-        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=None)
+        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=attention_mask)
         outputs[0].backward(outputs[0])
+
+        # past = DynamicCache()
+        assert torch.allclose(outputs[0], ref[0], atol=1e-3), f"{outputs[0], ref[0]}"
+
+        for p1, p2 in zip(attention.named_parameters(), attention2.named_parameters()):
+            print(torch.max(p1[1].grad[0] - p2[1].grad[0]))
+            assert torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-2, atol=1e-2), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}"
+            p1[1].grad = None
+            p2[1].grad = None
 
         torch.cuda.synchronize()
         epoch_time = time.time() - start_time
@@ -635,7 +665,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
+        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -647,7 +677,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=1024
+        "--max_length", type=int, default=16
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()

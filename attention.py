@@ -106,6 +106,7 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
+    print(attention)
     
     position_ids = torch.arange(
         0, args.max_length, device=device
@@ -122,7 +123,7 @@ def benchmark_dp(rank, args, world_size):
     attention_mask = attention_mask.triu(diagonal=1)
     attention_mask = attention_mask[None, None, :, :].expand(inputs.shape[0], 1, -1, -1)
 
-    print(attention_mask)
+    # print(attention_mask)
     
     torch.cuda.synchronize()
     for epoch in range(num_epochs):
@@ -130,8 +131,7 @@ def benchmark_dp(rank, args, world_size):
         start_time = time.time()
         outputs = attention(hidden_states=inputs, position_ids=position_ids, attention_mask=attention_mask)
 
-
-        # outputs[0].backward(outputs[0])
+        outputs[0].backward(outputs[0])
         torch.cuda.synchronize()
 
         epoch_time = time.time() - start_time

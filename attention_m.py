@@ -192,8 +192,8 @@ class LlamaSdpaAttention(nn.Module):
 
         causal_mask = attention_mask
         # if attention_mask is not None and cache_position is not None:
-        if attention_mask is not None:
-            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+        # if attention_mask is not None:
+        #     causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -253,7 +253,13 @@ class LlamaSdpaAttention(nn.Module):
             for i in range(self.mini):
                 hidden_states_mini = hidden_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :]
                 if attention_mask is None:
-                    attention_mask_mini = None
+                    L = (q_len//self.mini)
+                    S = (q_len//self.mini)*(i+1)
+                    attention_mask_mini = torch.ones(L, S, dtype=torch.bool, device=hidden_states.device).tril(diagonal=(q_len//self.mini)*i)
+                    attn_bias = torch.zeros(L, S, dtype=hidden_states.dtype, device=hidden_states.device)
+                    attn_bias.masked_fill_(attention_mask_mini.logical_not(), float("-inf"))
+                    attn_bias.to(hidden_states.dtype)
+                    attention_mask_mini = attn_bias
                 else:
                     attention_mask_mini = attention_mask[:,:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :(i+1)*(q_len//self.mini)]
                 position_ids_mini = position_ids[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini)]
@@ -351,7 +357,7 @@ class LlamaFlashAttention2(nn.Module):
             for i in range(self.mini):
                 hidden_states_mini = hidden_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :]
                 if attention_mask is None:
-                    attention_mask_mini = None
+                    attention_mask_mini=None
                 else:
                     attention_mask_mini = attention_mask[:,:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :(i+1)*(q_len//self.mini)]
                 position_ids_mini = position_ids[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini)]
@@ -635,11 +641,11 @@ def benchmark_dp(rank, args, world_size):
         start_time = time.time()
         # seqinputs = inputs.clone().detach()
 
-        ref =  attention2(hidden_states=batch, position_ids=position_ids, attention_mask=attention_mask)
+        ref =  attention2(hidden_states=batch, position_ids=position_ids, attention_mask=None)
         ref[0].backward(ref[0])
 
         past_key_value = DynamicCache()
-        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=attention_mask)
+        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=None)
         outputs[0].backward(outputs[0])
 
         # past = DynamicCache()
