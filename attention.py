@@ -119,9 +119,10 @@ def benchmark_dp(rank, args, world_size):
     dtype, device = inputs.dtype, inputs.device
     min_dtype = torch.finfo(dtype).min
     
-    attention_mask = torch.full((args.max_length, args.max_length), fill_value=min_dtype, dtype=dtype, device=device)
-    attention_mask = attention_mask.triu(diagonal=1)
-    attention_mask = attention_mask[None, None, :, :].expand(inputs.shape[0], 1, -1, -1)
+    # attention_mask = torch.full((args.max_length, args.max_length), fill_value=min_dtype, dtype=dtype, device=device)
+    # attention_mask = attention_mask.triu(diagonal=1)
+    # attention_mask = attention_mask[None, None, :, :].expand(inputs.shape[0], 1, -1, -1)
+    attention_mask = None
 
     # print(attention_mask)
     
@@ -131,7 +132,7 @@ def benchmark_dp(rank, args, world_size):
         start_time = time.time()
         outputs = attention(hidden_states=inputs, position_ids=position_ids, attention_mask=attention_mask)
 
-        outputs[0].backward(outputs[0])
+        # outputs[0].backward(outputs[0])
         torch.cuda.synchronize()
 
         epoch_time = time.time() - start_time

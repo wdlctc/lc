@@ -25,8 +25,8 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+# from flash_attn import flash_attn_func, flash_attn_varlen_func
+# from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 from rtp.rotated_tensor_parallel import RotatedTensorParallel
 
@@ -204,14 +204,15 @@ class LlamaSdpaAttention(nn.Module):
 
         # In case we are not compiling, we may set `causal_mask` to None, which is required to dispatch to SDPA's Flash Attention 2 backend, rather
         # relying on the `is_causal` argument.
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=causal_mask is None and q_len > 1,
-        )
+        with torch.backends.cuda.sdp_kernel(enable_math=False):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=causal_mask is None and q_len > 1,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
@@ -253,13 +254,7 @@ class LlamaSdpaAttention(nn.Module):
             for i in range(self.mini):
                 hidden_states_mini = hidden_states[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :]
                 if attention_mask is None:
-                    L = (q_len//self.mini)
-                    S = (q_len//self.mini)*(i+1)
-                    attention_mask_mini = torch.ones(L, S, dtype=torch.bool, device=hidden_states.device).tril(diagonal=(q_len//self.mini)*i)
-                    attn_bias = torch.zeros(L, S, dtype=hidden_states.dtype, device=hidden_states.device)
-                    attn_bias.masked_fill_(attention_mask_mini.logical_not(), float("-inf"))
-                    attn_bias.to(hidden_states.dtype)
-                    attention_mask_mini = attn_bias
+                    attention_mask_mini = None
                 else:
                     attention_mask_mini = attention_mask[:,:, i*(q_len//self.mini): (i+1)*(q_len//self.mini), :(i+1)*(q_len//self.mini)]
                 position_ids_mini = position_ids[:, i*(q_len//self.mini): (i+1)*(q_len//self.mini)]
@@ -633,7 +628,7 @@ def benchmark_dp(rank, args, world_size):
     attention_mask = attention_mask.triu(diagonal=1)
     attention_mask = attention_mask[None, None, :, :].expand(batch.shape[0], 1, -1, -1)
 
-    print(attention_mask)
+    # print(attention_mask)
     
     torch.cuda.synchronize()
     for epoch in range(num_epochs):
@@ -680,10 +675,10 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=1
     )
     parser.add_argument(
-        "--num_samples", type=int, default=10
+        "--num_samples", type=int, default=1
     )
     parser.add_argument(
-        "--max_length", type=int, default=16
+        "--max_length", type=int, default=1024
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
