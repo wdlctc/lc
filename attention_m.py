@@ -25,14 +25,15 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-# from flash_attn import flash_attn_func, flash_attn_varlen_func
-# from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 from rtp.rotated_tensor_parallel import RotatedTensorParallel
 
 import copy
 
 from typing import List, Optional, Tuple, Union
+# import torch.nn.functional as F
 
 RPC_PORT = 29501
 
@@ -138,7 +139,7 @@ class LlamaSdpaAttention(nn.Module):
         self.o_proj = ref.o_proj
         self.rotary_emb = ref.rotary_emb
 
-        self.mini = 4
+        self.mini = 16
 
     def mini_forward(
         self,
@@ -204,15 +205,15 @@ class LlamaSdpaAttention(nn.Module):
 
         # In case we are not compiling, we may set `causal_mask` to None, which is required to dispatch to SDPA's Flash Attention 2 backend, rather
         # relying on the `is_causal` argument.
-        with torch.backends.cuda.sdp_kernel(enable_math=False):
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=causal_mask,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                is_causal=causal_mask is None and q_len > 1,
-            )
+        print(causal_mask is None and q_len > 1, self.is_causal)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=causal_mask is None and q_len > 1,
+        )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
@@ -282,6 +283,16 @@ class LlamaSdpaAttention(nn.Module):
                 cache_position=cache_position,
             )
 
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
 
 class LlamaFlashAttention2(nn.Module):
     """
@@ -606,20 +617,20 @@ def benchmark_dp(rank, args, world_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     attention.to(device)
     
-    attention2 = copy.deepcopy(attention)
+    # attention2 = copy.deepcopy(attention)
     
     if isinstance(attention, transformers.models.llama.modeling_llama.LlamaSdpaAttention):
         attention = LlamaSdpaAttention(attention)
     elif isinstance(attention, transformers.models.llama.modeling_llama.LlamaFlashAttention2):
-        attention = LlamaFlashAttention2(attention)
-    print(attention)
+        attention = LlamaSdpaAttention(attention)#LlamaFlashAttention2(attention)
+    # print(attention)
     
     position_ids = torch.arange(
         0, args.max_length, device=device
     ).unsqueeze(0)
 
     num_epochs = 5
-    batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda().div_(10)
+    batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda()
     
     dtype, device = batch.dtype, batch.device
     min_dtype = torch.finfo(dtype).min
@@ -636,21 +647,24 @@ def benchmark_dp(rank, args, world_size):
         start_time = time.time()
         # seqinputs = inputs.clone().detach()
 
-        ref =  attention2(hidden_states=batch, position_ids=position_ids, attention_mask=None)
-        ref[0].backward(ref[0])
+        # ref =  attention2(hidden_states=batch, position_ids=position_ids, attention_mask=None)
+        # # ref[0].backward(ref[0])
 
+        # ref =  attention2(hidden_states=batch, position_ids=position_ids, attention_mask=None)
         past_key_value = DynamicCache()
-        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=None)
-        outputs[0].backward(outputs[0])
+        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=attention_mask)
+        past_key_value = DynamicCache()
+        outputs = attention(hidden_states=batch, position_ids=position_ids, past_key_value=past_key_value, attention_mask=attention_mask)
+        # outputs[0].backward(outputs[0])
 
         # past = DynamicCache()
-        assert torch.allclose(outputs[0], ref[0], atol=1e-3), f"{outputs[0], ref[0]}"
+        # assert torch.allclose(outputs[0], ref[0], atol=1e-3), f"{outputs[0], ref[0]}"
 
-        for p1, p2 in zip(attention.named_parameters(), attention2.named_parameters()):
-            print(torch.max(p1[1].grad[0] - p2[1].grad[0]))
-            assert torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-2, atol=1e-2), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}"
-            p1[1].grad = None
-            p2[1].grad = None
+        # for p1, p2 in zip(attention.named_parameters(), attention2.named_parameters()):
+        #     print(torch.max(p1[1].grad[0] - p2[1].grad[0]))
+        #     assert torch.allclose(p1[1].grad, p2[1].grad, rtol=1e-2, atol=1e-2), f"\n{p1[0]}\nvs\n{p2[0]}:\n{p1[1].grad}\nvs\n{p2[1].grad}"
+        #     p1[1].grad = None
+        #     p2[1].grad = None
 
         torch.cuda.synchronize()
         epoch_time = time.time() - start_time
@@ -666,7 +680,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"

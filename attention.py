@@ -124,6 +124,7 @@ def benchmark_dp(rank, args, world_size):
     # attention_mask = attention_mask[None, None, :, :].expand(inputs.shape[0], 1, -1, -1)
     attention_mask = None
 
+    # attention.is_causal = False
     # print(attention_mask)
     
     torch.cuda.synchronize()
@@ -132,7 +133,7 @@ def benchmark_dp(rank, args, world_size):
         start_time = time.time()
         outputs = attention(hidden_states=inputs, position_ids=position_ids, attention_mask=attention_mask)
 
-        # outputs[0].backward(outputs[0])
+        outputs[0].backward(outputs[0])
         torch.cuda.synchronize()
 
         epoch_time = time.time() - start_time
