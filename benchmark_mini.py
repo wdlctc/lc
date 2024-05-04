@@ -131,7 +131,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=4096
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()

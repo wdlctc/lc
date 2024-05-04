@@ -5,6 +5,7 @@ import time
 import tempfile
 
 import torch
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from torch.optim import AdamW
@@ -12,10 +13,27 @@ from torch.optim import AdamW
 from utils import load, load_jsonl, load_data
 from datasets import load_dataset, load_from_disk
 
+import transformers
 from transformers import TrainingArguments, TextDataset, DataCollatorForLanguageModeling
 
 import numpy as np
 import copy
+
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generator,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from torch.utils.data import IterableDataset, DataLoader
 class PreprocessedIterableDataset(IterableDataset):
@@ -61,6 +79,75 @@ class PreprocessedIterableDataset(IterableDataset):
 
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
+
+class SequenceWarpper(nn.Module):
+    def __init__(
+        self,
+        module: nn.Module,
+        split = 1
+    ):
+        super().__init__()
+        self.module = module
+        self.split = split
+        
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+
+        inputs = args[0]
+        
+        bsz, q_len, _ = inputs.size()
+
+        input_list = inputs.split(q_len // self.split, dim=1)
+
+        output_list = [None for _ in range(self.split)]
+
+        for i in range(self.split):
+            output = self.module(input_list[i])
+            output_list[i] = output
+
+        outputs = torch.cat(output_list, dim=1)
+            
+        return outputs
+        
+
+class TpSequenceParallel(nn.Module):
+    def __init__(
+        self,
+        module,
+        group: Optional[Any] = None):
+        super().__init__()
+        
+        self.module = module
+        
+        self.RecursiveVisit('module', self.module, self)
+        
+    def RecursiveVisit(self, name, module, upper_module):
+        """
+        Recursively replace layers in the module with the custom layer.
+        
+        Args:
+        - module (nn.Module): The module (or model) to modify.
+        - custom_layer_class (nn.Module): The custom layer class to replace with.
+        """
+            
+        has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
+        has_child = any(isinstance(child, nn.Module) for child in module.children())
+        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention) or isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP) or isinstance(module, transformers.models.gpt_neo.modeling_gpt_neo.GPTNeoMLP) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2Attention) or isinstance(module, transformers.models.gpt2.modeling_gpt2.GPT2MLP)
+        is_linear = nn.Linear
+
+        if has_child and not is_MultiheadAttention:
+            for name, child in module.named_children():
+                self.RecursiveVisit(name, child, module)
+        else:
+                
+            if isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP):
+                module = SequenceWarpper(module, split=8)
+                setattr(upper_module, name, module)
+                
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        outputs = self.module(*args, **kwargs)
+        return outputs
+
+
 def main(args):
     # Specify the pretrained model name or path
     model_name = args.model_name
@@ -75,6 +162,8 @@ def main(args):
     model.to(device)
 
     model.gradient_checkpointing_enable()
+    model = TpSequenceParallel(model)
+
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
     # Random data generator dataset class
@@ -96,21 +185,13 @@ def main(args):
     num_samples = args.num_samples  # Number of random samples you want to generate
     max_length = args.max_length  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
-
     
     # DataLoader
-    # data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
-    from datasets import load_dataset, load_from_disk
-    dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
-    dataset = PreprocessedIterableDataset(dataset, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
-
-    print(model)
+    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     # Set up the optimizer
     # Training loop
-    num_epochs = 3
+    num_epochs = 1
     
     position_ids = torch.arange(
         0, args.max_length, device=device
@@ -121,19 +202,16 @@ def main(args):
         model.train()
         total_loss = 0
     
-        for batch in dataloader:
+        for batch in data_loader:
             
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            labels[labels == pad_idx] = -100
+            inputs = batch.to(device)
 
-            outputs = model(**batch, labels=labels)
+            outputs = model(input_ids=inputs, labels=inputs)
             loss = outputs.loss
             loss.backward()
             total_loss += loss.item()
-            break
 
-        avg_loss = total_loss
+        avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
 
@@ -148,7 +226,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="meta-llama/Meta-Llama-3-8B"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -160,7 +238,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=4096
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
