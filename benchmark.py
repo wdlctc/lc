@@ -74,7 +74,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    model.gradient_checkpointing_enable()
+    # model.gradient_checkpointing_enable()
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
     # Random data generator dataset class
@@ -148,7 +148,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="meta-llama/Meta-Llama-3-8B"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"

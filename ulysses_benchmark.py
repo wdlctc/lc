@@ -330,11 +330,6 @@ class SequenceParallel(nn.Module):
             for name, child in module.named_children():
                 self.RecursiveVisit(name, child, module)
         else:
-            # if isinstance(module, nn.Embedding):
-            #     if module.embedding_dim % self.world_size == 0:
-            #         module.weight = nn.Parameter(split_tensor(module.weight, self.world_size, dim=1)[self.rank])
-            #         module = EmbedderWarpper(module, self.group)
-            #         setattr(upper_module, name, module)
             if isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention):
                 module = AttentionWarpper(module, self.group)
                 setattr(upper_module, name, module)
@@ -432,7 +427,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="openai-community/gpt2-medium"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
