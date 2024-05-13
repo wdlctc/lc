@@ -131,6 +131,8 @@ def main(args):
             loss = outputs.loss
             loss.backward()
             total_loss += loss.item()
+            optimizer.step()
+            optimizer.zero_grad()
             break
 
         avg_loss = total_loss
@@ -160,7 +162,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=4096
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
