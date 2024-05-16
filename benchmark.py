@@ -74,7 +74,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable()
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
     # Random data generator dataset class
@@ -97,7 +97,6 @@ def main(args):
     max_length = args.max_length  # Maximum length of the sequence
     dataset = RandomDataGenerator(tokenizer, num_samples, max_length)
 
-    
     # DataLoader
     # data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
@@ -110,7 +109,7 @@ def main(args):
     
     # Set up the optimizer
     # Training loop
-    num_epochs = 3
+    num_epochs = 5
     
     position_ids = torch.arange(
         0, args.max_length, device=device
@@ -120,24 +119,28 @@ def main(args):
         start_time = time.time()
         model.train()
         total_loss = 0
-    
+
+        step = 0
         for batch in dataloader:
-            
+            step+=1
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["input_ids"].clone()
             labels[labels == pad_idx] = -100
 
-            outputs = model(**batch, labels=labels)
-            loss = outputs.loss
+            loss = model(**batch, labels=labels).loss
             loss.backward()
             total_loss += loss.item()
-            optimizer.step()
-            optimizer.zero_grad()
-            break
+            if step == 2:
+                break
 
+        optimizer.step()
+        optimizer.zero_grad()
+        
         avg_loss = total_loss
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {avg_loss:.4f} - Time: {epoch_time:.2f} seconds")
+
+    
 
 
     print(
@@ -162,7 +165,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=4096
+        "--max_length", type=int, default=8192
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
