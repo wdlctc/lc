@@ -19,6 +19,7 @@ from transformers import LlamaForCausalLM
 import numpy as np
 import datasets
 from torch.utils.data import IterableDataset, DataLoader
+import matplotlib.pyplot as plt
 
 
 class PreprocessedIterableDataset(IterableDataset):
@@ -118,6 +119,13 @@ def evaluate_model(model, preprocess_batched, pad_idx, device, batch_size):
 
     return total_loss, evaluated_on_tokens 
 
+def init_random_seed(seed: int):
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+
+
 def main(args):
     # Specify the pretrained model name or path
     model_name = args.model_name
@@ -125,10 +133,13 @@ def main(args):
     # Load the tokenizer and pretrained model
     tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
     model_config = AutoConfig.from_pretrained(args.model_config)
+
+    init_random_seed(42)
     
     model = LlamaForCausalLM(model_config)
     tokenizer.pad_token = tokenizer.eos_token
     pad_idx = tokenizer.pad_token_id
+    model = model.bfloat16()
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -136,7 +147,7 @@ def main(args):
     model.gradient_checkpointing_enable()
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, betas=(0.9, 0.95), eps=1e-5, weight_decay=args.weight_decay)
     
     # Instantiate the dataset
     num_samples = args.num_samples  # Number of random samples you want to generate
@@ -159,7 +170,10 @@ def main(args):
 
     step = 0
     num_epochs = 3
+    log_interval = 10
     update_time = time.time()
+    total_loss = 0
+    losses = []
     for epoch in range(num_epochs):
         model.train()
         for batch in dataloader:
@@ -172,18 +186,28 @@ def main(args):
 
             loss = model(**batch, labels=labels).loss
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
             optimizer.step()
             optimizer.zero_grad()
 
-            print(loss)
-            if step == 2:
-                print(
-                    "Peak allocated bytes on {:4f}GB".format(
-                        torch.cuda.memory_stats(0)["allocated_bytes.all.peak"] / 2**30
-                    )
-                )
-                return
+            total_loss += loss
+            if step % log_interval == 0:
+                print(total_loss.item() / log_interval)
+                losses.append(total_loss.item()/ log_interval)
+                total_loss = 0
+                
+            if step == 1000:
+                break
+        break
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
+
+    import csv
+    output_file = "training_loss.csv"
+    with open(output_file, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Step", "Loss"])
+        for i, loss in enumerate(losses):
+            writer.writerow([i, loss])
 
     print(
         "Peak allocated bytes on {:4f}GB".format(
@@ -206,11 +230,12 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=4096
+        "--max_length", type=int, default=8192
     )
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--eval_every", type=int, default=100)
+    parser.add_argument("--grad_clipping", type=float, default=1)
     args = parser.parse_args()
 
     main(args)
