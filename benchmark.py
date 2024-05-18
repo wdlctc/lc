@@ -109,7 +109,7 @@ def main(args):
     
     # Set up the optimizer
     # Training loop
-    num_epochs = 5
+    num_epochs = 3
     
     position_ids = torch.arange(
         0, args.max_length, device=device

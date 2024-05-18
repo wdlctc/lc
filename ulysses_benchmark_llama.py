@@ -360,8 +360,10 @@ def benchmark_dp(rank, args, world_size):
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+
+    model.gradient_checkpointing_enable()
     
-    model = FullyShardedDataParallel(SequenceParallel(model))
+    model = DDP(SequenceParallel(model))
 
     print(model)
     
@@ -406,12 +408,11 @@ def benchmark_dp(rank, args, world_size):
     
         for batch in data_loader:
             inputs = batch.to(device)
-            outputs = model(input_ids=inputs, labels=inputs, position_ids=position_ids, cache_position=cache_position)
-            loss = outputs.loss
+            loss = model(input_ids=inputs, labels=inputs, position_ids=position_ids, cache_position=cache_position).loss
             loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
             total_loss += loss.item()
+        optimizer.step()
+        optimizer.zero_grad()
     
         avg_loss = total_loss / len(data_loader)
         epoch_time = time.time() - start_time
@@ -427,7 +428,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -436,10 +437,10 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=1
     )
     parser.add_argument(
-        "--num_samples", type=int, default=10
+        "--num_samples", type=int, default=2
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=1024
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
