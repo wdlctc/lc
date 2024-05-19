@@ -88,44 +88,45 @@ def benchmark_dp(rank, args, world_size):
             
         has_parameters = any(isinstance(param, nn.Parameter) for param in module.parameters())
         has_child = any(isinstance(child, nn.Module) for child in module.children())
-        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaAttention)
+        is_MultiheadAttention = isinstance(module, transformers.models.llama.modeling_llama.LlamaMLP)
 
         if has_child and not is_MultiheadAttention:
             for name, child in module.named_children():
                 m = RecursiveVisit(name, child, module)
-                if isinstance(m, transformers.models.llama.modeling_llama.LlamaAttention):
+                if isinstance(m, transformers.models.llama.modeling_llama.LlamaMLP):
                     return m
         else:
             return module
 
-    attention = RecursiveVisit('name', model, model)
-    attention.training = True
+    mlp = RecursiveVisit('name', model, model)
 
     del model
     
     # Move the model to GPU(s)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    attention.to(device)
-    print(attention)
+    mlp.to(device)
+    print(mlp)
     
-    position_ids = torch.arange(
-        0, args.max_length, device=device
-    ).unsqueeze(0)
-    
-    num_epochs = 5
-    batch = torch.randn(args.batch_size, args.max_length, attention.hidden_size, dtype=torch.float16).cuda()
+    num_epochs = 3
+    batch = torch.randn(args.batch_size, args.max_length, mlp.hidden_size, dtype=torch.float16).cuda()
     inputs = batch.to(device)
     
     dtype, device = inputs.dtype, inputs.device
     min_dtype = torch.finfo(dtype).min
+
+    # mlp.gate_proj.weight.requires_grad = False
+    # mlp.up_proj.weight.requires_grad = False
+    # mlp.down_proj.weight.requires_grad = False
+    # inputs.requires_grad = True
     
     torch.cuda.synchronize()
     for epoch in range(num_epochs):
         init_random_seed(epoch)
         start_time = time.time()
         for i in range(100):
-            outputs = attention(hidden_states=inputs, position_ids=position_ids, attention_mask=attention_mask)
-            outputs.backward(outputs)
+            mean = mlp(inputs).mean()
+            mean.backward()
+            # outputs.backward(outputs)
         torch.cuda.synchronize()
 
         epoch_time = time.time() - start_time
@@ -141,7 +142,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf"
+        "--model_name", type=str, default="meta-llama/Meta-Llama-3-8B"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -153,7 +154,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=4096
+        "--max_length", type=int, default=1024
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
