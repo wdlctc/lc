@@ -154,7 +154,7 @@ def main(args):
     max_length = args.max_length  # Maximum length of the sequence
 
     # Load the "allenai/c4" dataset with streaming=True
-    dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
+    dataset = load_dataset("togethercomputer/Long-Data-Collections", "default", split="train", streaming=True)
     dataset = PreprocessedIterableDataset(dataset, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
 
@@ -179,10 +179,13 @@ def main(args):
         for batch in dataloader:
 
             step += 1
+
             
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["input_ids"].clone()
             labels[labels == pad_idx] = -100
+            
+            # print(torch.sum(torch.ne(labels, -100)))
 
             loss = model(**batch, labels=labels).loss
             loss.backward()
@@ -232,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_length", type=int, default=8192
     )
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--grad_clipping", type=float, default=1)
