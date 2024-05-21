@@ -174,6 +174,8 @@ def main(args):
     update_time = time.time()
     total_loss = 0
     losses = []
+    
+    init_random_seed(42)
     for epoch in range(num_epochs):
         model.train()
         for batch in dataloader:
