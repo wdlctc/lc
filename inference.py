@@ -63,7 +63,7 @@ def main(args):
             outputs = model(input_ids=inputs, past_key_values=past_key_values, use_cache=True)
             pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
             generated_ids = [pred_token_idx.item()]
-            for _ in range(50):
+            for _ in range(64):
                 outputs = model(
                     input_ids=pred_token_idx,
                     past_key_values=past_key_values,
@@ -102,7 +102,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="openai-community/gpt2"
+        "--model_name", type=str, default="meta-llama/Llama-2-13b-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -111,10 +111,10 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=1
     )
     parser.add_argument(
-        "--num_samples", type=int, default=10
+        "--num_samples", type=int, default=2
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=12000
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
