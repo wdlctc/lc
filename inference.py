@@ -62,7 +62,8 @@ def main(args):
             past_key_values = None
             outputs = model(input_ids=inputs, past_key_values=past_key_values, use_cache=True)
             pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-            generated_ids = [pred_token_idx.item()]
+            print(inputs.shape, pred_token_idx.shape)
+            # generated_ids = [pred_token_idx.item()]
             for _ in range(64):
                 outputs = model(
                     input_ids=pred_token_idx,
@@ -72,19 +73,19 @@ def main(args):
                 
                 past_key_values = outputs.past_key_values
                 pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-                generated_ids.append(pred_token_idx.item())
-                generated_text = (
-                    tokenizer.decode(
-                        generated_ids,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=True,
-                        spaces_between_special_tokens=False,
-                    )
-                    .strip()
-                    .split(" ")
-                )
+            #     generated_ids.append(pred_token_idx.item())
+            #     generated_text = (
+            #         tokenizer.decode(
+            #             generated_ids,
+            #             skip_special_tokens=True,
+            #             clean_up_tokenization_spaces=True,
+            #             spaces_between_special_tokens=False,
+            #         )
+            #         .strip()
+            #         .split(" ")
+            #     )
                 
-            print(" ".join(generated_text[:]), flush=True)
+            # print(" ".join(generated_text[:]), flush=True)
             
             end_time = time.time()
             batch_time = end_time - start_time
@@ -108,13 +109,13 @@ if __name__ == "__main__":
         "--dataset_name", type=str, default="yelp_review_full"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=1
+        "--batch_size", type=int, default=64
     )
     parser.add_argument(
-        "--num_samples", type=int, default=2
+        "--num_samples", type=int, default=8
     )
     parser.add_argument(
-        "--max_length", type=int, default=12000
+        "--max_length", type=int, default=1024
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
