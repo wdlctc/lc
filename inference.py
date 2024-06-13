@@ -115,7 +115,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=8
     )
     parser.add_argument(
-        "--max_length", type=int, default=1024
+        "--max_length", type=int, default=2264
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
