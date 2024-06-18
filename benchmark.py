@@ -162,10 +162,10 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=1
     )
     parser.add_argument(
-        "--num_samples", type=int, default=10
+        "--num_samples", type=int, default=5
     )
     parser.add_argument(
-        "--max_length", type=int, default=8192
+        "--max_length", type=int, default=1024
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()

@@ -21,6 +21,10 @@ from torch.distributed.fsdp import FullyShardedDataParallel
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
+import transformers
+import functools
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing, checkpoint_wrapper, CheckpointImpl
+
 RPC_PORT = 29501
 
 def init_random_seed(seed: int):
@@ -50,6 +54,14 @@ def benchmark_dp(rank, args, world_size):
     model.to(device)
     
     model = FullyShardedDataParallel(model)
+    # model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': True})
+
+    non_reentrant_wrapper = functools.partial(
+        checkpoint_wrapper,
+        checkpoint_impl=CheckpointImpl.REENTRANT,
+    )
+
+    apply_activation_checkpointing(model, checkpoint_wrapper_fn=non_reentrant_wrapper)
     
     optimizer = AdamW(model.parameters(), lr=5e-5)
     
@@ -107,7 +119,7 @@ def benchmark_dp(rank, args, world_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name", type=str, default="openai-community/gpt2"
+        "--model_name", type=str, default="meta-llama/Llama-2-7b-hf"
     )
     parser.add_argument(
         "--dataset_name", type=str, default="yelp_review_full"
@@ -119,7 +131,7 @@ if __name__ == "__main__":
         "--num_samples", type=int, default=10
     )
     parser.add_argument(
-        "--max_length", type=int, default=512
+        "--max_length", type=int, default=8192
     )
     parser.add_argument("--data_root", type=str, default="data/")
     args = parser.parse_args()
