@@ -12,7 +12,7 @@ from torch.optim import AdamW
 from utils import load, load_jsonl, load_data
 from datasets import load_dataset, load_from_disk
 
-from transformers import TrainingArguments, TextDataset, DataCollatorForLanguageModeling, Trainer, TrainingArguments
+from transformers import TrainingArguments, TextDataset, DataCollatorForLanguageModeling, Trainer
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from transformers import LlamaForCausalLM
 
@@ -154,9 +154,13 @@ def main(args):
     max_length = args.max_length  # Maximum length of the sequence
 
     # Load the "allenai/c4" dataset with streaming=True
-    dataset = load_dataset("togethercomputer/Long-Data-Collections", "default", split="train", streaming=True)
-    dataset = PreprocessedIterableDataset(dataset, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
+    
+    # dataset = load_dataset('wikitext', 'wikitext-2-raw-v1')
+    dataset = load_dataset('togethercomputer/Long-Data-Collections', "default", split="train", streaming=True)
+    dataset = dataset['train']
+    # dataset = load_dataset("togethercomputer/Long-Data-Collections", "default", split="train", streaming=True)
+    # dataset = PreprocessedIterableDataset(dataset, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
+    # dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
 
     def preprocess_batched(batch):
         batch = tokenizer(
@@ -167,52 +171,124 @@ def main(args):
             return_tensors="pt",
         )
         return batch
+        
+    tokenized_datasets = dataset.map(lambda x: preprocess_batched(x), batched=True)
+    tokenized_datasets = tokenized_datasets.remove_columns(["text", "prompt", "completion"])
 
+    def convert_to_torch_dataset(tokenized_dataset):
+        return tokenized_dataset.with_format("torch")
+    
+    tokenized_datasets = convert_to_torch_dataset(tokenized_datasets)
+    
     step = 0
     num_epochs = 3
     log_interval = 10
     update_time = time.time()
     total_loss = 0
     losses = []
+
+    # Define training arguments
+    training_args = TrainingArguments(
+        output_dir=f"output_{max_length}",
+        evaluation_strategy="epoch",
+        learning_rate=2e-5,
+        num_train_epochs=3,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        save_total_limit=2,
+        weight_decay=0.01,
+    )
+
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_datasets,
+        eval_dataset=tokenized_datasets,
+    )
+
+    # Train the model
+    trainer.train()
     
-    init_random_seed(42)
-    for epoch in range(num_epochs):
-        model.train()
-        for batch in dataloader:
+    # init_random_seed(42)
+    # for epoch in range(num_epochs):
+    #     model.train()
+    #     for batch in dataloader:
 
-            step += 1
+    #         step += 1
 
+    #         batch = {k: v.to(device) for k, v in batch.items()}
+    #         labels = batch["input_ids"].clone()
+    #         labels[labels == pad_idx] = -100
             
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            labels[labels == pad_idx] = -100
-            
-            # print(torch.sum(torch.ne(labels, -100)))
+    #         loss = model(**batch, labels=labels).loss
+    #         loss.backward()
+    #         torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
+    #         optimizer.step()
+    #         optimizer.zero_grad()
 
-            loss = model(**batch, labels=labels).loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
-            optimizer.step()
-            optimizer.zero_grad()
-
-            total_loss += loss
-            if step % log_interval == 0:
-                print(total_loss.item() / log_interval)
-                losses.append(total_loss.item()/ log_interval)
-                total_loss = 0
+    #         total_loss += loss
+    #         if step % log_interval == 0:
+    #             print(total_loss.item() / log_interval)
+    #             losses.append(total_loss.item()/ log_interval)
+    #             total_loss = 0
                 
-            if step == 1000:
-                break
-        break
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
+    #     break
+    #     print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
 
-    import csv
-    output_file = "training_loss.csv"
-    with open(output_file, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["Step", "Loss"])
-        for i, loss in enumerate(losses):
-            writer.writerow([i, loss])
+    
+    # output_dir = "trained_model"
+    # os.makedirs(output_dir, exist_ok=True)
+    
+    # model.generation_config.pad_token_id = tokenizer.pad_token_id
+    
+    # model.save_pretrained(output_dir)
+    # tokenizer.save_pretrained(output_dir)
+
+
+    # batch_size=args.batch_size
+    # _time = time.time()
+    # val_data = load_dataset("togethercomputer/Long-Data-Collections", "default", split="train", streaming=True)
+    # val_data = val_data.shuffle(seed=42)
+    # print(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
+
+    # val_data_mapped = val_data.map(
+    #     preprocess_batched,
+    #     batched=True,
+    #     remove_columns=["text"],
+    # )
+    # val_data_mapped.batch = lambda batch_size: batch_fn(val_data_mapped, batch_size)
+
+    # target_eval_tokens = 10_000_000
+    # evaluated_on_tokens = 0
+    # total_loss = torch.tensor(0.0).to(device)
+    # total_batches = 1
+    # print(f"Eval set prepared in {time.time() - _time:.2f} seconds")
+
+    # for batch in val_data_mapped.batch(batch_size=batch_size):
+    #     if evaluated_on_tokens > target_eval_tokens:
+    #         break
+    #     total_batches += 1
+
+    #     batch = {k: v.to(device) for k, v in batch.items()}
+    #     labels = batch["input_ids"].clone()
+    #     labels[labels == pad_idx] = -100
+    #     loss = model(**batch, labels=labels).loss
+    #     total_loss += loss.detach()
+
+    #     evaluated_on_tokens += (batch["input_ids"] != pad_idx).sum().item()
+
+    # total_loss = total_loss / total_batches
+
+    # print(total_loss)
+
+    # import csv
+    # output_file = "training_loss.csv"
+    # with open(output_file, "w", newline="") as csvfile:
+    #     writer = csv.writer(csvfile)
+    #     writer.writerow(["Step", "Loss"])
+    #     for i, loss in enumerate(losses):
+    #         writer.writerow([i, loss])
 
     print(
         "Peak allocated bytes on {:4f}GB".format(
