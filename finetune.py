@@ -122,8 +122,8 @@ def main(model_name_or_path, train_file, valid_file=None, valid_split=0.1, batch
                 outputs = model(**batch)
             loss = outputs.loss
             eval_loss += loss.detach().float()
-            preds = accelerator.gather_for_metrics(torch.argmax(outputs.logits, -1)).detach().cpu().numpy()
-            eval_preds.extend(tokenizer.batch_decode(preds, skip_special_tokens=True))
+            # preds = accelerator.gather_for_metrics(torch.argmax(outputs.logits, -1)).detach().cpu().numpy()
+            # eval_preds.extend(tokenizer.batch_decode(preds, skip_special_tokens=True))
         eval_epoch_loss = eval_loss / len(eval_dataloader)
         eval_ppl = torch.exp(eval_epoch_loss)
         train_epoch_loss = total_loss / len(train_dataloader)
