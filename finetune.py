@@ -8,19 +8,25 @@ from accelerate import Accelerator
 from datasets import load_dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW, default_data_collator, get_linear_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, AdamW, default_data_collator, get_linear_schedule_with_warmup
+from transformers import LlamaForCausalLM
 
 
 def main(model_name_or_path, train_file, valid_file=None, valid_split=0.1, batch_size=8, text_column="text",
-         max_length=4096, lr=1e-3, num_epochs=1, use_flash_attn=False, torch_dtype=torch.float16, output_dir=""):
+         max_length=4096, lr=1e-3, weight_decay=0.1, num_epochs=1, use_flash_attn=False, torch_dtype=torch.float16, output_dir=""):
     accelerator = Accelerator()
     label_column = text_column # For CausalLM, the target is the original string
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        torch_dtype=torch_dtype,
-        use_flash_attention_2=use_flash_attn
-    )
+    model_config = AutoConfig.from_pretrained(args.model_config)
+
+    model = LlamaForCausalLM(model_config)
+    model = model.bfloat16()
+
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     model_name_or_path,
+    #     torch_dtype=torch_dtype,
+    #     use_flash_attention_2=use_flash_attn
+    # )
 
     dataset = DatasetDict()
     
@@ -88,7 +94,9 @@ def main(model_name_or_path, train_file, valid_file=None, valid_split=0.1, batch
     # When using FSDP, it is efficient and recommended to call prepare for the model before creating the optimizer
     model = accelerator.prepare(model)
 
-    optimizer = AdamW(model.parameters(), lr=lr)
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=0,
@@ -110,9 +118,11 @@ def main(model_name_or_path, train_file, valid_file=None, valid_split=0.1, batch
             loss = outputs.loss
             total_loss += loss.detach().float()
             accelerator.backward(loss)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            print(loss)
 
         model.eval()
         eval_loss = 0
@@ -149,6 +159,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Finetune a Causal LLM with FSDP.")
     parser.add_argument(
         "--model-name-or-path", type=str, default="meta-llama/Llama-2-7b-hf", help="model path"
+    )
+    parser.add_argument(
+        "--model_config", type=str, default="configs/llama2_7b.json"
     )
     parser.add_argument(
         "--train-file",
@@ -190,6 +203,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output-dir", type=str, default="", help="Output dir to save model"
     )
+    parser.add_argument("--weight_decay", type=float, default=0.1)
 
     args = parser.parse_args()
 
@@ -208,6 +222,7 @@ if __name__ == "__main__":
         args.text_column,
         args.max_length,
         args.learning_rate,
+        args.weight_decay,
         args.num_epochs,
         args.use_flash_attn,
         torch_types[args.torch_dtype],
