@@ -11,12 +11,18 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, AdamW, default_data_collator, get_linear_schedule_with_warmup
 from transformers import LlamaForCausalLM
 
+def init_random_seed(seed: int):
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
 def main(model_name_or_path, train_file, valid_file=None, valid_split=0.1, batch_size=8, text_column="text",
          max_length=4096, lr=1e-3, weight_decay=0.1, num_epochs=1, use_flash_attn=False, torch_dtype=torch.float16, output_dir=""):
     accelerator = Accelerator()
     label_column = text_column # For CausalLM, the target is the original string
 
+    init_random_seed(42)
+    
     model_config = AutoConfig.from_pretrained(args.model_config)
 
     model = LlamaForCausalLM(model_config)
